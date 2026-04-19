@@ -1,0 +1,398 @@
+Interface Emulation for Control of a
+Thermo CRS F3 6DOF Robot
+
+As replacement for the original robot controller CRS C500C
+
+
+Description of the existing communication between the
+original robot controller "CRS C500C" and the
+Thermo CRS F3 6DOF Robot
+
++-----------+					+-----------------+
+|			| -----RS485---->	|	Thermo CRS	  |
+|	CRS 	| <----RS485-----	|	 F3  6DOF 	  |
+|	C500C 	| 					|	 Robot  	  |
+|			| ---- Power --->	|				  |
++-----------+					+-----------------+
+
+
+New Setup
+
+
++-----------+							+-----------------+
+|   iceFUN	|--MAX3485(Tx)---RS485-->	|	Thermo CRS	  |
+|	iCE40	|--MAX3485(Rx)<--RS485---	|	 F3  6DOF 	  |
+|	HX8K 	| 							|	 Robot  	  |
+|	FPGA	| 							|				  |
++-----------+							+-----------------+
+   ^										^
+   | SPI									|
+   v										|
++---------+									|
+|  ESP32  | --> Relays --> Power -----------+
+|   S3	  |
+|  N8R8   |
++---------+
+
+Protocol Structure between 
+Thermo CRS F3 6DOF Robot & CRS C500C Main Controller 
+----------------------------------------------------------
+- Half-Duplex RS485 Communication
+- Multi Drop Bus - Frame format (9 Bit Chars)
+Communication speed and structure: 
+1.25 Mbps, 1 Start + 8 data + address bit + 1 stop, LSB-first
+
+
+
+
+7 Bytes / Frame  (each byte is sent as a 9-bit char)
+
+Regarding Multi Drop Bus - Frame format: 
+Each byte sent or received via RS485 has an address bit.
+- For all bytes of frames received by the robot, the address bit is LOW
+- Address bit of all bytes on the Rx/Slave line is always low
+- The first byte sent by the master (nodeID) has the address bit HIGH 
+
+Master:
+	Node_ID,Bytes[0:4],CRC 
+Slave:
+	Node_ID,Bytes[0:4],CRC 
+	
+	
+CRC Calculation:
+	-> CRC8: poly 0x01, init 0x00, no xorout 
+	-> XOR of all bytes including Node_ID == CRC	
+	
+NodeIDs:
+	- 0x10 Waist module
+	- 0x08 Wrist module
+	- 0x11 Shoulder
+	- 0x09 Wrist_2
+	- 0x12 Elbow
+	- 0x0A Wrist_3
+
+	- (0x20 Gripper only on request)
+	
+Master Commands (Byte[0])
+	- 0x8F Init Solver Module
+	- 0x7A Init Absolute Encoders
+	- 0x91 Reset Module & Encoders
+		Init & Reset Sequence is master-side fixed (see below)
+	- 0x31 Position Command
+	Details on Position-Command:
+	Master :
+	 NodeId, 0x31, Pos1, Pos2, Pos3, Flags, CRC
+	 
+	Slave :
+	 NodeId, Pos1, Pos2, Pos3, Status1, Status2, CRC
+		
+
+The master communicates here with 6 hardware-routed resolvers.
+Routing is determined by the Node_ID. 
+Therefore, only the Node_ID byte on the master line has the address bit set to HIGH, 
+followed by a -significant- pause to the next byte.
+The pause on the master line (~50uS) between the Node_ID and DeviceCommand bytes
+serves for hardware routing of both communication lines based on the received Node_ID.	
+
+In main communication (after init sequence), the master sends position queries
+to each of the 6 main NodeIDs in temporally staggered sequences
+
+The slave always responds directly on the other line as long as the node is still routed.
+Before the master then addresses the next NodeID
+ 
+Timing overview for repetitive position query/control:
+
+//Master Request Line				//Slave Response Line
+
+10 {Rest-Frame}		->	~30uS	->		10 {Rest-Frame}	
+Short Pause ~ 500uS
+08 {Rest-Frame}		->	~30uS	->		08 {Rest-Frame}	
+Mid pause   ~ 1500µS
+11 {Rest-Frame}		->	~30uS	->		11 {Rest-Frame}	
+Short Pause ~ 500uS
+09 {Rest-Frame}		->	~30uS	->		09 {Rest-Frame}	
+Mid pause   ~ 1500µS
+10 {Rest-Frame}		->	~30uS	->		10 {Rest-Frame}	
+Short Pause ~ 500uS
+08 {Rest-Frame}		->	~30uS	->		08 {Rest-Frame}	
+Long pause ~ ~5500µS
+
+The master sends requests in the shown rhythm (with tolerance ~+- 10us).
+Changes to setpoints are only passed within these cyclic intervals,
+depending on who currently has setpoint authority.
+
+
+
+If needed, instead of the long pause (after at least one mid-pause delay)
+other frames like Gripper or Reset can be sent.
+However, these are embedded in the existing timing and do not change the main rhythm.
+
+
+Init Sequence Examples:
+Both for a successful init sequence and for one where the battery voltage of the 
+encoders was interrupted (re-homing necessary before robot can be used) 
+
+
+---------------------------------======================={ INIT SEQUENCE SUCCESS Example }=======================---------------------------------
+
+=================================================================================================================================================
+ timestamp  | Role /	| 		Master Channel (Tx)									| 				Slave Channel (Rx)							|
+   [ms]		| Channel	|  															|															|
+============|===========|===========================================================|===========================================================|
+			|			|	NodeID	CMD		|    Init Sequence (fixed)	|	CRC		|  NodeID	| Init response -> Store Frames		|	CRC		|
+------------|-----------|-----------------------------------------------------------|-----------------------------------------------------------|
+0,000000	|	MASTER	|	0x10	0x8F	0x09	0x00	0x00	0x97	0x01	|															|	Block A
+0,150833	|	SLAVE	|															|	0x10	0x00	0x00	0x00	0x00	0x00	0x10	|
+2,498333	|	MASTER	|	0x08	0x8F	0x09	0x00	0x00	0x97	0x19	|															|
+2,650167	|	SLAVE	|															|	0x08	0x00	0x00	0x00	0x00	0x00	0x08	|
+------------|-----------|-----------------------------------------------------------|-----------------------------------------------------------|
+9,998250	|	MASTER	|	0x10	0x7A	0x01	0xE6	0x06	0x01	0x8A	|															|	Block B
+10,154292	|	SLAVE	|															|	0x10	0x7A	0x00	0x00	0x00	0x00	0x6A	|
+12,501417	|	MASTER	|	0x08	0x7A	0x01	0xE6	0x06	0x01	0x92	|															|
+12,654083	|	SLAVE	|															|	0x08	0x7A	0x00	0x00	0x00	0x00	0x72	|
+20,002125	|	MASTER	|	0x11	0x7A	0x01	0xE6	0x06	0x01	0x8B	|															|
+20,158583	|	SLAVE	|															|	0x11	0x7A	0x00	0x00	0x00	0x00	0x6B	|
+22,502125	|	MASTER	|	0x09	0x7A	0x01	0xE6	0x06	0x01	0x93	|															|
+22,658792	|	SLAVE	|															|	0x09	0x7A	0x00	0x00	0x00	0x00	0x73	|
+30,006833	|	MASTER	|	0x12	0x7A	0x01	0xE6	0x06	0x01	0x88	|															|
+30,162833	|	SLAVE	|															|	0x12	0x7A	0x00	0x00	0x00	0x00	0x68	|
+32,506000	|	MASTER	|	0x0A	0x7A	0x01	0xE6	0x06	0x01	0x90	|															|
+32,661917	|	SLAVE	|															|	0x0A	0x7A	0x00	0x00	0x00	0x00	0x70	|
+============|===========|===========================================================|===========================================================|
+			|			|	NodeID	CMD		POS.1	POS.2	POS.3	Flags	CRC		|  NodeID	POS.1	POS.2	POS.3	Flags1	Flags2	CRC		|
+------------|-----------|-----------------------------------------------------------|-----------------------------------------------------------|
+34,011250	|	MASTER	|	0x10	0x31	0x00	0x00	0x00	0x26	0x07	|															|	Block C
+34,170333	|	SLAVE	|															|	0x10	0x00	0x00	0x00	0x00	0x40	0x50	|
+34,520208	|	MASTER	|	0x08	0x31	0x00	0x00	0x00	0x26	0x1F	|															|
+34,679167	|	SLAVE	|															|	0x08	0x00	0x00	0x00	0x00	0x40	0x48	|
+36,011875	|	MASTER	|	0x11	0x31	0x00	0x00	0x00	0x26	0x06	|															|
+36,171667	|	SLAVE	|															|	0x11	0x00	0x00	0x00	0x00	0x40	0x51	|
+36,524833	|	MASTER	|	0x09	0x31	0x00	0x00	0x00	0x26	0x1E	|															|
+36,686833	|	SLAVE	|															|	0x09	0x00	0x00	0x00	0x00	0x40	0x49	|
+38,015667	|	MASTER	|	0x12	0x31	0x00	0x00	0x00	0x26	0x05	|															|
+38,181792	|	SLAVE	|															|	0x12	0x00	0x00	0x00	0x00	0x40	0x52	|
+38,522250	|	MASTER	|	0x0A	0x31	0x00	0x00	0x00	0x26	0x1D	|															|
+38,680083	|	SLAVE	|															|	0x0A	0x00	0x00	0x00	0x00	0x40	0x4A	|
+------------|-----------|-----------------------------------------------------------|-----------------------------------------------------------|
+44,015125	|	MASTER	|	0x10	0x31	0x00	0x00	0x00	0x26	0x07	|															|	Block D
+44,174583	|	SLAVE	|															|	0x10	0xA5	0x02	0x00	0x00	0x40	0xF7	|
+44,524083	|	MASTER	|	0x08	0x31	0x00	0x00	0x00	0x26	0x1F	|															|
+44,684708	|	SLAVE	|															|	0x08	0x1B	0x07	0x00	0x00	0x40	0x54	|
+46,015750	|	MASTER	|	0x11	0x31	0x00	0x00	0x00	0x26	0x06	|															|
+46,175125	|	SLAVE	|															|	0x11	0x23	0x00	0x00	0x00	0x40	0x72	|
+46,528708	|	MASTER	|	0x09	0x31	0x00	0x00	0x00	0x26	0x1E	|															|
+46,688375	|	SLAVE	|															|	0x09	0xD3	0x00	0x00	0x00	0x40	0x9A	|
+48,017167	|	MASTER	|	0x12	0x31	0x00	0x00	0x00	0x26	0x05	|															|
+48,175667	|	SLAVE	|															|	0x12	0x30	0x03	0x00	0x00	0x40	0x61	|
+48,526125	|	MASTER	|	0x0A	0x31	0x00	0x00	0x00	0x26	0x1D	|															|
+48,685625	|	SLAVE	|															|	0x0A	0x7A	0x00	0x00	0x00	0x40	0x30	|
+------------|-----------|-----------------------------------------------------------|-----------------------------------------------------------|
+54,023792	|	MASTER	|	0x10	0x31	0xA5	0x02	0x00	0x26	0xA0	|															|	Block E // Motors Unarmed (Slave-Position-Control)
+54,178042	|	SLAVE	|															|	0x10	0xA5	0x02	0x00	0x00	0x40	0xF7	|	Slave  POS.1	POS.2	POS.3 overrides Master POS.1	POS.2	POS.3
+54,532750	|	MASTER	|	0x08	0x31	0x1B	0x07	0x00	0x26	0x03	|															|
+54,688625	|	SLAVE	|															|	0x08	0x1B	0x07	0x00	0x00	0x40	0x54	|
+56,020417	|	MASTER	|	0x11	0x31	0x23	0x00	0x00	0x26	0x25	|															|
+56,180167	|	SLAVE	|															|	0x11	0x23	0x00	0x00	0x00	0x40	0x72	|
+56,532583	|	MASTER	|	0x09	0x31	0xD3	0x00	0x00	0x26	0xCD	|															|
+56,697083	|	SLAVE	|															|	0x09	0xD3	0x00	0x00	0x00	0x40	0x9A	|
+58,021042	|	MASTER	|	0x12	0x31	0x30	0x03	0x00	0x26	0x36	|															|
+58,179917	|	SLAVE	|															|	0x12	0x30	0x03	0x00	0x00	0x40	0x61	|
+58,530000	|	MASTER	|	0x0A	0x31	0x7A	0x00	0x00	0x26	0x67	|															|
+58,689542	|	SLAVE	|															|	0x0A	0x7A	0x00	0x00	0x00	0x40	0x30	|
+------------|-----------|-----------------------------------------------------------|-----------------------------------------------------------|
+Repeat Block E until master takes control
+------------|-----------|-----------------------------------------------------------|-----------------------------------------------------------|
+
+------------|-----------|-----------------------------------------------------------|-----------------------------------------------------------|
+XX,XXXXXX	|	MASTER	|	0x10	0x31	0xA5	0x02	0x00	0x04	0x82	|															|	Block F // Motors Armed (Master-Position-Control)
+XX,XXXXXX	|	SLAVE	|															|	0x10	0xA5	0x02	0x00	0x00	0x00	0xF7	|	Master POS.1	POS.2	POS.3 is attempted to be executed by slave
+XX,XXXXXX	|	MASTER	|	0x08	0x31	0x1B	0x07	0x00	0x04	0x21	|															|
+XX,XXXXXX	|	SLAVE	|															|	0x08	0x1B	0x07	0x00	0x00	0x00	0x54	|
+XX,XXXXXX	|	MASTER	|	0x11	0x31	0x23	0x00	0x00	0x04	0x07	|															|
+XX,XXXXXX	|	SLAVE	|															|	0x11	0x23	0x00	0x00	0x00	0x00	0x72	|
+XX,XXXXXX	|	MASTER	|	0x09	0x31	0xD3	0x00	0x00	0x04	0xEF	|															|
+XX,XXXXXX	|	SLAVE	|															|	0x09	0xD3	0x00	0x00	0x00	0x00	0x9A	|
+XX,XXXXXX	|	MASTER	|	0x12	0x31	0x2F	0x03	0x00	0x04	0x0B	|															|
+XX,XXXXXX	|	SLAVE	|															|	0x12	0x30	0x03	0x00	0x00	0x00	0x61	|
+XX,XXXXXX	|	MASTER	|	0x0A	0x31	0x7A	0x00	0x00	0x04	0x45	|															|
+XX,XXXXXX	|	SLAVE	|															|	0x0A	0x7A	0x00	0x00	0x00	0x00	0x30	|
+------------|-----------|-----------------------------------------------------------|-----------------------------------------------------------|
+
+
+
+ 
+ Block A
+ First init sequence: This addresses only node 0x10 and 0x08 and is always identical on every start
+ Master -> Slave delta T is also always ~30us, but between node 10 and node 08 there are ~2.38ms
+ 
+ Block B 
+ All 6 nodes are addressed. Second initialization stage
+ Short pauses are 1ms longer, mid pauses are 2ms longer and between block B and C there is only a short pause + 1ms
+ 
+ Block C
+ The master requests the current position and status for all nodes
+ The slave is not yet ready and responds with 00 00 00
+ Short, Mid and Long pauses are normal from here on
+ 
+ Block D
+ The master receives the current values in the response here
+ 
+ These values serve as setpoint from now on.
+ If the robot is "Unarmed" (motors off), individual joints can be changed manually by releasing the brakes manually
+ In this "unarmed" state, the master always adopts the current setpoint from the slave. 
+ The slave then essentially has set-point authority
+ 
+ Just as the master adopted the values from response frames in Block D into the next request in Block E.
+ 
+ Block E
+ Is simply a current-state example for "unarmed" when the robot is not moved despite being "unarmed" and maintains its position
+ (e.g. through the brakes)
+ 
+ Block F (Explanation of original communication behavior)
+ The master has initiated the Armed (Motor On) state (0x26 --> 0x04) in the Status&Control byte (last byte before CRC)
+   In this state, each resolver will actively try to reach the set setpoint by moving the motors
+ (similar to PID controller). 
+ The master is now responsible for adjusting all desired setpoints in small increments 
+ (depending on desired speed and acceleration).
+ 
+ ------------------------------
+ (Explanation of new communication behavior)
+ In the new version, the ESP must first take over set-point authority via SPI command and can then 
+ change the Status&Control byte (last byte before CRC) from 0x26 to 0x04.
+ Once the ESP has set-point authority, new position information is only stored in the response frame,
+ but not used for the next request as before. This way the ESP can still read the last valid position from the response and
+ write a changed position into the next request, which the resolver then attempts to reach.
+ 
+
+
+---------------------------------======================={ INIT SEQUENCE Failed Example }=======================---------------------------------
+
+=================================================================================================================================================
+ timestamp  | Role /	| 		Master Channel (Tx)									| 				Slave Channel (Rx)							|
+   [ms]		| Channel	|  															|															|
+============|===========|===========================================================|===========================================================|
+			|			|	NodeID	CMD		|    Init Sequence (fixed)	|	CRC		|  NodeID	| Init response -> Store Frames		|	CRC		|
+------------|-----------|-----------------------------------------------------------|-----------------------------------------------------------|
+0,0000000	|	MASTER	|	0x10	0x8F	0x09	0x00	0x00	0x97	0x01	|															|	Block A
+0,1550840	|	SLAVE	|															|	0x10	0x00	0x00	0x00	0x00	0x00	0x10	|
+2,4983340	|	MASTER	|	0x08	0x8F	0x09	0x00	0x00	0x97	0x19	|															|
+2,6547500	|	SLAVE	|															|	0x08	0x00	0x00	0x00	0x00	0x00	0x08	|
+------------|-----------|-----------------------------------------------------------|-----------------------------------------------------------|
+10,007084	|	MASTER	|	0x10	0x7A	0x01	0xE6	0x06	0x01	0x8A	|															|	Block B
+10,160167	|	SLAVE	|															|	0x10	0x7A	0x00	0x00	0x00	0x00	0x6A	|
+12,502250	|	MASTER	|	0x08	0x7A	0x01	0xE6	0x06	0x01	0x92	|															|
+12,658667	|	SLAVE	|															|	0x08	0x7A	0x00	0x00	0x00	0x00	0x72	|
+20,007750	|	MASTER	|	0x11	0x7A	0x01	0xE6	0x06	0x01	0x8B	|															|
+20,164459	|	SLAVE	|															|	0x11	0x7A	0x00	0x00	0x00	0x00	0x6B	|
+22,510917	|	MASTER	|	0x09	0x7A	0x01	0xE6	0x06	0x01	0x93	|															|
+22,662625	|	SLAVE	|															|	0x09	0x7A	0x00	0x00	0x00	0x00	0x73	|
+30,012459	|	MASTER	|	0x12	0x7A	0x01	0xE6	0x06	0x01	0x88	|															|
+30,169542	|	SLAVE	|															|	0x12	0x7A	0x00	0x00	0x00	0x00	0x68	|
+32,510834	|	MASTER	|	0x0A	0x7A	0x01	0xE6	0x06	0x01	0x90	|															|
+32,666542	|	SLAVE	|															|	0x0A	0x7A	0x00	0x00	0x00	0x00	0x70	|
+============|===========|===========================================================|===========================================================|
+			|			|	NodeID	CMD		POS.1	POS.2	POS.3	Flags	CRC		|  NodeID	POS.1	POS.2	POS.3	Flags1	Flags2	CRC		|
+------------|-----------|-----------------------------------------------------------|-----------------------------------------------------------|
+34,519459	|	MASTER	|	0x08	0x31	0x00	0x00	0x00	0x26	0x1F	|															|	Block C
+34,677417	|	SLAVE	|															|	0x08	0x00	0x00	0x00	0x00	0x44	0x4C	|
+36,019917	|	MASTER	|	0x11	0x31	0x00	0x00	0x00	0x26	0x06	|															|
+36,177542	|	SLAVE	|															|	0x11	0x00	0x00	0x00	0x00	0x44	0x55	|
+36,533667	|	MASTER	|	0x09	0x31	0x00	0x00	0x00	0x26	0x1E	|															|
+36,691500	|	SLAVE	|															|	0x09	0x00	0x00	0x00	0x00	0x44	0x4D	|
+38,016542	|	MASTER	|	0x12	0x31	0x00	0x00	0x00	0x26	0x05	|															|
+38,176459	|	SLAVE	|															|	0x12	0x00	0x00	0x00	0x00	0x44	0x56	|
+38,534292	|	MASTER	|	0x0A	0x31	0x00	0x00	0x00	0x26	0x1D	|															|
+38,688750	|	SLAVE	|															|	0x0A	0x00	0x00	0x00	0x00	0x44	0x4E	|
+44,020000	|	MASTER	|	0x10	0x31	0x00	0x00	0x00	0x26	0x07	|															|
+44,178875	|	SLAVE	|															|	0x10	0x00	0x00	0x00	0x00	0x44	0x54	|
+------------|-----------|-----------------------------------------------------------|-----------------------------------------------------------|
+44,532959	|	MASTER	|	0x08	0x31	0x00	0x00	0x00	0x26	0x1F	|															|	Block D
+44,693375	|	SLAVE	|															|	0x08	0x64	0x26	0x00	0x40	0x44	0x4E	|
+46,022209	|	MASTER	|	0x11	0x31	0x00	0x00	0x00	0x26	0x06	|															|
+46,183417	|	SLAVE	|															|	0x11	0x00	0x00	0x00	0x40	0x44	0x15	|
+46,533542	|	MASTER	|	0x09	0x31	0x00	0x00	0x00	0x26	0x1E	|															|
+46,689834	|	SLAVE	|															|	0x09	0x3D	0x08	0x00	0x40	0x44	0x38	|
+48,026000	|	MASTER	|	0x12	0x31	0x00	0x00	0x00	0x26	0x05	|															|
+48,180750	|	SLAVE	|															|	0x12	0x12	0x08	0x00	0x40	0x44	0x0C	|
+48,538959	|	MASTER	|	0x0A	0x31	0x00	0x00	0x00	0x26	0x1D	|															|
+48,694292	|	SLAVE	|															|	0x0A	0x74	0x0D	0x00	0x40	0x44	0x77	|
+54,023084	|	MASTER	|	0x10	0x31	0x00	0x00	0x00	0x26	0x07	|															|
+54,182375	|	SLAVE	|															|	0x10	0xA3	0x0A	0x00	0x40	0x44	0xBD	|
+------------|-----------|-----------------------------------------------------------|-----------------------------------------------------------|
+54,536834	|	MASTER	|	0x08	0x31	0x64	0x26	0x00	0x26	0x5D	|															|	Block E
+54,697292	|	SLAVE	|															|	0x08	0x64	0x26	0x00	0x40	0x44	0x4E	|
+56,023709	|	MASTER	|	0x11	0x31	0x00	0x00	0x00	0x26	0x06	|															|
+56,182125	|	SLAVE	|															|	0x11	0x00	0x00	0x00	0x40	0x44	0x15	|
+56,538250	|	MASTER	|	0x09	0x31	0x3D	0x08	0x00	0x26	0x2B	|															|
+56,697792	|	SLAVE	|															|	0x09	0x3D	0x08	0x00	0x40	0x44	0x38	|
+58,025125	|	MASTER	|	0x12	0x31	0x12	0x08	0x00	0x26	0x1F	|															|
+58,181042	|	SLAVE	|															|	0x12	0x12	0x08	0x00	0x40	0x44	0x0C	|
+58,538084	|	MASTER	|	0x0A	0x31	0x74	0x0D	0x00	0x26	0x64	|															|
+58,698250	|	SLAVE	|															|	0x0A	0x74	0x0D	0x00	0x40	0x44	0x77	|
+64,026959	|	MASTER	|	0x10	0x31	0xA3	0x0A	0x00	0x26	0xAE	|															|
+64,185875	|	SLAVE	|															|	0x10	0xA3	0x0A	0x00	0x40	0x44	0xBD	|
+============|===========|===========================================================|===========================================================|
+// Repeat Block E
+
+
+
+Error Response:
+No immediate hard abort on individual deviations or set flags.
+Decision authority should be with the ESP32 later
+
+ 
+The init sequence should take place autonomously on the FPGA up to Block E and loop until the ESP gives instructions
+The FPGA should validate the incoming CRC for response frames from the robot and reject the response frame on mismatch.
+
+The FPGA should validate the incoming CRC for frames to be sent received via SPI.
+
+ESP32 --> FPGA 
+NodeId, 0x31, Pos1, Pos2, Pos3, Flags, ESP_Calc_CRC
+FPGA validates ESP_Calc_CRC and only then sets the new position.
+
+
+On mismatch, reject the frame and possibly inform the ESP
+Within the autonomous init sequence, on CRC mismatch or "no-response", the request is simply repeated. 
+
+
+ 
+The FPGA should ONLY be a communication and validation gateway with buffer.
+The ESP gets full control over the FPGA and the interface
+ - Setting set-point authority via SPI command
+ - Reading init responses
+ - Reading last valid positions and status flags from buffered NodeID, 0x31,..., response frames
+ - Setting the 6 new set-points and flags when it has set-point authority via SPI command.
+ - Setting additional frames to be sent within the long pause
+ - Reading response frames received for the additional frames.
+ - Starting the init sequence via SPI command and automatically remaining in "Block E" loop with received position data 
+   (thereby set-point authority is given to the robot --> byte before CRC must = 0x26). 
+ 
+The ESP sends asynchronously and only updates.
+When no new info arrives, the main loop should continue.
+ - Either robot has set-point authority and sets the current position which is used for the next get position requests
+ - or FPGA still has set-point authority and then it sends the last valid position data, regardless of what other positions the robot sends
+ 
+iCE40|	Function
+Pins |
+-----|---------------------
+E14	 | MAX3485 En (Master)		must be HIGH
+F12  | MAX3485 Tx (Master)  
+G14  | MAX3485 Rx (Slave )	(G14 = IOR_141_GBIN2 --> Global Buffer Inputs)
+H12  | MAX3485 En (Slave )		must be LOW
+G1   | SPI SCK (to ESP32)
+H1   | SPI MOSI (to ESP32)
+J1   | SPI CS (to ESP32)
+L1   | SPI MISO (to ESP32)
+P7   | internal FPGA-Clock (clk_12m)
+-----+----------------------
+
+ESP32  | Function
+Pins   |
+-------+-------------------
+GPIO10 | CS SPI (to FPGA)
+GPIO11 | MOSI SPI (to FPGA)
+GPIO12 | SCK SPI (to FPGA)
+GPIO13 | MISO SPI (to FPGA)
+
+
+

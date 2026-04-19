@@ -1,0 +1,9 @@
+set_io clk_12m P7 # CLOCK 12MHZ is on P7 DO NOT TOUCH!
+set_io rs485_en_master E14
+set_io rs485_tx_master F12
+set_io rs485_rx_slave G14
+set_io rs485_en_slave H12
+set_io spi_sck G1
+set_io spi_mosi H1
+set_io spi_cs_n J1
+set_io spi_miso L1

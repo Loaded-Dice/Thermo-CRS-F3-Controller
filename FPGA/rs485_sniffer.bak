@@ -1,0 +1,843 @@
+// ================================================
+// iceFUN iCE40 HX8K - Dual RS485 9-bit frame sniffer
+// H1 + J1: 1.25 Mbps, 1 start + 8 data + address bit + 1 stop, LSB-first
+// Frame: idle >= 160 us, then 7 characters (NBC1..NBC7)
+// CRC8: poly 0x01, init 0x00, no xorout -> XOR of NBC1..NBC6
+// TX: 115200, 8N1; output every 500 ms:
+//   H1 block (6 frames) then J1 block (6 frames), each frame 9 bytes
+// ================================================
+
+module rs485_sniffer (
+    input  wire clk_12m,
+    input  wire rx_h1,
+    input  wire rx_j1,
+    output reg  tx,
+    input  wire spi_cs_n,
+    input  wire spi_sclk,
+    input  wire spi_mosi,
+    output reg  spi_miso
+);
+
+    // Generate the internal high-speed system clock from the 12 MHz crystal.
+    // All timing constants below (UART sampling, frame gap detection, TX pacing)
+    // are defined for this derived clock domain.
+    (* keep = "true" *) wire clk;
+    SB_PLL40_CORE #(
+        .FEEDBACK_PATH("SIMPLE"),
+        .DIVR(4'd0),
+        .DIVF(7'd39),
+        .DIVQ(3'd3),
+        .FILTER_RANGE(3'b001)
+    ) pll_inst (
+        .REFERENCECLK(clk_12m),
+        .PLLOUTGLOBAL(clk),
+        .RESETB(1'b1),
+        .BYPASS(1'b0)
+    );
+
+    localparam RX_BIT_TICKS = 48;
+    localparam RX_HALF_BIT  = 24;
+    localparam TX_TICKS     = 521;
+    localparam SEND_TICKS   = 25'd30_000_000; // 500 ms @ 60 MHz
+    localparam FRAME_GAP_TICKS = 14'd9600;    // 160 us @ 60 MHz
+
+    localparam [7:0] ADDR_10 = 8'h10;
+    localparam [7:0] ADDR_08 = 8'h08;
+    localparam [7:0] ADDR_11 = 8'h11;
+    localparam [7:0] ADDR_09 = 8'h09;
+    localparam [7:0] ADDR_12 = 8'h12;
+    localparam [7:0] ADDR_0A = 8'h0A;
+
+    localparam [7:0] SPI_CMD_RESET_FIFO = 8'hA0;
+    localparam [7:0] SPI_CMD_READ_FIFO  = 8'hA1;
+    localparam [7:0] SPI_CMD_READ_LAST  = 8'hA2;
+    localparam [6:0] FIFO_DEPTH = 7'd16;
+
+    localparam [2:0] RX_IDLE  = 0,
+                     RX_START = 1,
+                     RX_DATA  = 2,
+                     RX_MDB   = 3,
+                     RX_STOP  = 4;
+
+    // Input conditioning for H1: 2-flop synchronizer + 3-sample majority filter.
+    // This removes short spikes and safely transfers asynchronous RS485 input
+    // into the FPGA clock domain before bit timing is evaluated.
+    wire h1_raw = rx_h1;
+    (* keep = "true" *) reg [1:0] h1_sync = 2'b11;
+    (* keep = "true" *) reg [2:0] h1_filt = 3'b111;
+    always @(posedge clk) begin
+        h1_sync <= {h1_sync[0], h1_raw};
+        h1_filt <= {h1_filt[1:0], h1_sync[1]};
+    end
+    wire h1_in = (h1_filt[2] & h1_filt[1]) | (h1_filt[2] & h1_filt[0]) | (h1_filt[1] & h1_filt[0]);
+
+    // Same input conditioning chain for J1 (independent channel).
+    wire j1_raw = rx_j1;
+    (* keep = "true" *) reg [1:0] j1_sync = 2'b11;
+    (* keep = "true" *) reg [2:0] j1_filt = 3'b111;
+    always @(posedge clk) begin
+        j1_sync <= {j1_sync[0], j1_raw};
+        j1_filt <= {j1_filt[1:0], j1_sync[1]};
+    end
+    wire j1_in = (j1_filt[2] & j1_filt[1]) | (j1_filt[2] & j1_filt[0]) | (j1_filt[1] & j1_filt[0]);
+
+    // Per-channel UART-like receiver state.
+    // The bus format is 1 start, 8 data bits, 1 address/mark bit (MDB), 1 stop.
+    // h_* and j_* run in parallel and produce validated bytes + metadata.
+    (* keep = "true" *) reg [2:0] h_state = RX_IDLE;
+    (* keep = "true" *) reg [5:0] h_timer = 0;
+    (* keep = "true" *) reg [2:0] h_bit   = 0;
+    (* keep = "true" *) reg [7:0] h_shift = 0;
+    reg        h_prev = 1'b1;
+    reg [13:0] h_idle_ticks = 0;
+    reg        h_start_after_gap = 0;
+    reg [7:0]  h_byte = 0;
+    reg        h_byte_valid = 0;
+    reg        h_byte_after_gap = 0;
+    reg        h_mdb = 0;
+
+    (* keep = "true" *) reg [2:0] j_state = RX_IDLE;
+    (* keep = "true" *) reg [5:0] j_timer = 0;
+    (* keep = "true" *) reg [2:0] j_bit   = 0;
+    (* keep = "true" *) reg [7:0] j_shift = 0;
+    reg        j_prev = 1'b1;
+    reg [13:0] j_idle_ticks = 0;
+    reg        j_start_after_gap = 0;
+    reg [7:0]  j_byte = 0;
+    reg        j_byte_valid = 0;
+    reg        j_byte_after_gap = 0;
+    reg        j_mdb = 0;
+
+    // Temporary frame assembly buffers: once a frame start is detected
+    // (idle gap >= FRAME_GAP_TICKS), collect 7 bytes and validate CRC.
+    reg       h_frame_active = 0;
+    reg [2:0] h_frame_count = 0;
+    reg [7:0] h_frame_b0 = 0;
+    reg [7:0] h_frame_b1 = 0;
+    reg [7:0] h_frame_b2 = 0;
+    reg [7:0] h_frame_b3 = 0;
+    reg [7:0] h_frame_b4 = 0;
+    reg [7:0] h_frame_b5 = 0;
+    reg [7:0] h_frame_b6 = 0;
+    reg       h_frame_addr_bit = 0;
+    wire [7:0] h_frame_crc_calc = h_frame_b0 ^ h_frame_b1 ^ h_frame_b2 ^ h_frame_b3 ^ h_frame_b4 ^ h_frame_b5;
+
+    reg       j_frame_active = 0;
+    reg [2:0] j_frame_count = 0;
+    reg [7:0] j_frame_b0 = 0;
+    reg [7:0] j_frame_b1 = 0;
+    reg [7:0] j_frame_b2 = 0;
+    reg [7:0] j_frame_b3 = 0;
+    reg [7:0] j_frame_b4 = 0;
+    reg [7:0] j_frame_b5 = 0;
+    reg [7:0] j_frame_b6 = 0;
+    reg       j_frame_addr_bit = 0;
+    wire [7:0] j_frame_crc_calc = j_frame_b0 ^ j_frame_b1 ^ j_frame_b2 ^ j_frame_b3 ^ j_frame_b4 ^ j_frame_b5;
+
+    // Last-good snapshots per known address slot for H1/J1.
+    // Default payload is 0xEE to indicate "not seen yet" after power-up.
+    // Each slot stores 9 bytes: B0..B6, address bit, CRC.
+    reg       h_s0_valid = 0;
+    reg [7:0] h_s0_b0 = 8'hEE; reg [7:0] h_s0_b1 = 8'hEE; reg [7:0] h_s0_b2 = 8'hEE;
+    reg [7:0] h_s0_b3 = 8'hEE; reg [7:0] h_s0_b4 = 8'hEE; reg [7:0] h_s0_b5 = 8'hEE;
+    reg [7:0] h_s0_b6 = 8'hEE; reg       h_s0_addr_bit = 0; reg [7:0] h_s0_crc = 8'h00;
+
+    reg       h_s1_valid = 0;
+    reg [7:0] h_s1_b0 = 8'hEE; reg [7:0] h_s1_b1 = 8'hEE; reg [7:0] h_s1_b2 = 8'hEE;
+    reg [7:0] h_s1_b3 = 8'hEE; reg [7:0] h_s1_b4 = 8'hEE; reg [7:0] h_s1_b5 = 8'hEE;
+    reg [7:0] h_s1_b6 = 8'hEE; reg       h_s1_addr_bit = 0; reg [7:0] h_s1_crc = 8'h00;
+
+    reg       h_s2_valid = 0;
+    reg [7:0] h_s2_b0 = 8'hEE; reg [7:0] h_s2_b1 = 8'hEE; reg [7:0] h_s2_b2 = 8'hEE;
+    reg [7:0] h_s2_b3 = 8'hEE; reg [7:0] h_s2_b4 = 8'hEE; reg [7:0] h_s2_b5 = 8'hEE;
+    reg [7:0] h_s2_b6 = 8'hEE; reg       h_s2_addr_bit = 0; reg [7:0] h_s2_crc = 8'h00;
+
+    reg       h_s3_valid = 0;
+    reg [7:0] h_s3_b0 = 8'hEE; reg [7:0] h_s3_b1 = 8'hEE; reg [7:0] h_s3_b2 = 8'hEE;
+    reg [7:0] h_s3_b3 = 8'hEE; reg [7:0] h_s3_b4 = 8'hEE; reg [7:0] h_s3_b5 = 8'hEE;
+    reg [7:0] h_s3_b6 = 8'hEE; reg       h_s3_addr_bit = 0; reg [7:0] h_s3_crc = 8'h00;
+
+    reg       h_s4_valid = 0;
+    reg [7:0] h_s4_b0 = 8'hEE; reg [7:0] h_s4_b1 = 8'hEE; reg [7:0] h_s4_b2 = 8'hEE;
+    reg [7:0] h_s4_b3 = 8'hEE; reg [7:0] h_s4_b4 = 8'hEE; reg [7:0] h_s4_b5 = 8'hEE;
+    reg [7:0] h_s4_b6 = 8'hEE; reg       h_s4_addr_bit = 0; reg [7:0] h_s4_crc = 8'h00;
+
+    reg       h_s5_valid = 0;
+    reg [7:0] h_s5_b0 = 8'hEE; reg [7:0] h_s5_b1 = 8'hEE; reg [7:0] h_s5_b2 = 8'hEE;
+    reg [7:0] h_s5_b3 = 8'hEE; reg [7:0] h_s5_b4 = 8'hEE; reg [7:0] h_s5_b5 = 8'hEE;
+    reg [7:0] h_s5_b6 = 8'hEE; reg       h_s5_addr_bit = 0; reg [7:0] h_s5_crc = 8'h00;
+
+    reg       j_s0_valid = 0;
+    reg [7:0] j_s0_b0 = 8'hEE; reg [7:0] j_s0_b1 = 8'hEE; reg [7:0] j_s0_b2 = 8'hEE;
+    reg [7:0] j_s0_b3 = 8'hEE; reg [7:0] j_s0_b4 = 8'hEE; reg [7:0] j_s0_b5 = 8'hEE;
+    reg [7:0] j_s0_b6 = 8'hEE; reg       j_s0_addr_bit = 0; reg [7:0] j_s0_crc = 8'h00;
+
+    reg       j_s1_valid = 0;
+    reg [7:0] j_s1_b0 = 8'hEE; reg [7:0] j_s1_b1 = 8'hEE; reg [7:0] j_s1_b2 = 8'hEE;
+    reg [7:0] j_s1_b3 = 8'hEE; reg [7:0] j_s1_b4 = 8'hEE; reg [7:0] j_s1_b5 = 8'hEE;
+    reg [7:0] j_s1_b6 = 8'hEE; reg       j_s1_addr_bit = 0; reg [7:0] j_s1_crc = 8'h00;
+
+    reg       j_s2_valid = 0;
+    reg [7:0] j_s2_b0 = 8'hEE; reg [7:0] j_s2_b1 = 8'hEE; reg [7:0] j_s2_b2 = 8'hEE;
+    reg [7:0] j_s2_b3 = 8'hEE; reg [7:0] j_s2_b4 = 8'hEE; reg [7:0] j_s2_b5 = 8'hEE;
+    reg [7:0] j_s2_b6 = 8'hEE; reg       j_s2_addr_bit = 0; reg [7:0] j_s2_crc = 8'h00;
+
+    reg       j_s3_valid = 0;
+    reg [7:0] j_s3_b0 = 8'hEE; reg [7:0] j_s3_b1 = 8'hEE; reg [7:0] j_s3_b2 = 8'hEE;
+    reg [7:0] j_s3_b3 = 8'hEE; reg [7:0] j_s3_b4 = 8'hEE; reg [7:0] j_s3_b5 = 8'hEE;
+    reg [7:0] j_s3_b6 = 8'hEE; reg       j_s3_addr_bit = 0; reg [7:0] j_s3_crc = 8'h00;
+
+    reg       j_s4_valid = 0;
+    reg [7:0] j_s4_b0 = 8'hEE; reg [7:0] j_s4_b1 = 8'hEE; reg [7:0] j_s4_b2 = 8'hEE;
+    reg [7:0] j_s4_b3 = 8'hEE; reg [7:0] j_s4_b4 = 8'hEE; reg [7:0] j_s4_b5 = 8'hEE;
+    reg [7:0] j_s4_b6 = 8'hEE; reg       j_s4_addr_bit = 0; reg [7:0] j_s4_crc = 8'h00;
+
+    reg       j_s5_valid = 0;
+    reg [7:0] j_s5_b0 = 8'hEE; reg [7:0] j_s5_b1 = 8'hEE; reg [7:0] j_s5_b2 = 8'hEE;
+    reg [7:0] j_s5_b3 = 8'hEE; reg [7:0] j_s5_b4 = 8'hEE; reg [7:0] j_s5_b5 = 8'hEE;
+    reg [7:0] j_s5_b6 = 8'hEE; reg       j_s5_addr_bit = 0; reg [7:0] j_s5_crc = 8'h00;
+
+    reg [24:0] send_timer = 0;
+    reg        pkt_pending = 0;
+
+    // UART transmitter state for periodic dump output at 115200 8N1.
+    // It emits all 12 slots (H1[0..5], J1[0..5]) with 9 bytes per slot.
+    (* keep = "true" *) reg [9:0] tx_shift = 10'b1111111111;
+    (* keep = "true" *) reg [9:0] tx_timer = 0;
+    (* keep = "true" *) reg [3:0] tx_bits_left = 0;
+    (* keep = "true" *) reg       tx_active = 0;
+    reg       tx_packet_active = 0;
+    reg [3:0] tx_slot_idx = 0;
+    reg [3:0] tx_byte_idx = 0;
+
+    // FIFO for completed, CRC-valid frames. Intended as SPI-readable event queue.
+    // Width is 72 bits = 9 bytes/frame, depth is 16 entries.
+    reg [71:0] fifo_mem [0:15];
+    reg [3:0] fifo_wr_ptr = 0;
+    reg [3:0] fifo_rd_ptr = 0;
+    reg [6:0] fifo_count = 0;
+    reg [15:0] fifo_missed = 0;
+    reg        fifo_push_req_h = 0;
+    reg [71:0] fifo_push_word_h = 72'h0;
+    reg        fifo_push_req_j = 0;
+    reg [71:0] fifo_push_word_j = 72'h0;
+    reg        fifo_reset_req = 0;
+    reg        fifo_read_done_req = 0;
+
+    // SPI front-end registers. SCLK and CS are synchronized to clk so that
+    // command decoding and data shifting stay fully synchronous internally.
+    reg [2:0] spi_cs_sync = 3'b111;
+    reg [2:0] spi_sclk_sync = 3'b000;
+    reg [1:0] spi_mosi_sync = 2'b00;
+
+    reg [7:0] spi_rx_shift = 8'h00;
+    reg [7:0] spi_rx_byte = 8'h00;
+    reg [7:0] spi_tx_byte = 8'h00;
+    reg [2:0] spi_bit_cnt = 3'd0;
+    reg       spi_cmd_seen = 1'b0;
+    reg [7:0] spi_cmd = 8'h00;
+    reg [1:0] spi_mode = 2'd0; // 0=idle, 1=read fifo, 2=read last
+
+    reg [1:0] spi_fifo_phase = 2'd0;
+    reg [6:0] spi_fifo_count_snap = 0;
+    reg [15:0] spi_fifo_missed_snap = 0;
+    reg [3:0] spi_fifo_rd_ptr_snap = 0;
+    reg [6:0] spi_fifo_frame_idx = 0;
+    reg [3:0] spi_fifo_byte_idx = 0;
+
+    reg [3:0] spi_last_slot_idx = 0;
+    reg [3:0] spi_last_byte_idx = 0;
+
+    wire spi_cs_now = spi_cs_sync[2];
+    wire spi_cs_fall = (spi_cs_sync[2:1] == 2'b10);
+    wire spi_cs_rise = (spi_cs_sync[2:1] == 2'b01);
+    wire spi_sclk_rise = (spi_sclk_sync[2:1] == 2'b01);
+    wire spi_sclk_fall = (spi_sclk_sync[2:1] == 2'b10);
+
+    // Select one byte from one of the 12 persistent slots.
+    // Slot map:
+    //   0..5  -> H1 addresses 0x10,0x08,0x11,0x09,0x12,0x0A
+    //   6..11 -> J1 addresses 0x10,0x08,0x11,0x09,0x12,0x0A
+    function [7:0] slot_byte;
+        input [3:0] slot;
+        input [3:0] byte_idx;
+        begin
+            case (slot)
+                4'd0: begin case (byte_idx)
+                    4'd0: slot_byte = h_s0_b0; 4'd1: slot_byte = h_s0_b1; 4'd2: slot_byte = h_s0_b2;
+                    4'd3: slot_byte = h_s0_b3; 4'd4: slot_byte = h_s0_b4; 4'd5: slot_byte = h_s0_b5;
+                    4'd6: slot_byte = h_s0_b6; 4'd7: slot_byte = {7'b0, h_s0_addr_bit}; 4'd8: slot_byte = h_s0_crc;
+                    default: slot_byte = 8'h00; endcase end
+                4'd1: begin case (byte_idx)
+                    4'd0: slot_byte = h_s1_b0; 4'd1: slot_byte = h_s1_b1; 4'd2: slot_byte = h_s1_b2;
+                    4'd3: slot_byte = h_s1_b3; 4'd4: slot_byte = h_s1_b4; 4'd5: slot_byte = h_s1_b5;
+                    4'd6: slot_byte = h_s1_b6; 4'd7: slot_byte = {7'b0, h_s1_addr_bit}; 4'd8: slot_byte = h_s1_crc;
+                    default: slot_byte = 8'h00; endcase end
+                4'd2: begin case (byte_idx)
+                    4'd0: slot_byte = h_s2_b0; 4'd1: slot_byte = h_s2_b1; 4'd2: slot_byte = h_s2_b2;
+                    4'd3: slot_byte = h_s2_b3; 4'd4: slot_byte = h_s2_b4; 4'd5: slot_byte = h_s2_b5;
+                    4'd6: slot_byte = h_s2_b6; 4'd7: slot_byte = {7'b0, h_s2_addr_bit}; 4'd8: slot_byte = h_s2_crc;
+                    default: slot_byte = 8'h00; endcase end
+                4'd3: begin case (byte_idx)
+                    4'd0: slot_byte = h_s3_b0; 4'd1: slot_byte = h_s3_b1; 4'd2: slot_byte = h_s3_b2;
+                    4'd3: slot_byte = h_s3_b3; 4'd4: slot_byte = h_s3_b4; 4'd5: slot_byte = h_s3_b5;
+                    4'd6: slot_byte = h_s3_b6; 4'd7: slot_byte = {7'b0, h_s3_addr_bit}; 4'd8: slot_byte = h_s3_crc;
+                    default: slot_byte = 8'h00; endcase end
+                4'd4: begin case (byte_idx)
+                    4'd0: slot_byte = h_s4_b0; 4'd1: slot_byte = h_s4_b1; 4'd2: slot_byte = h_s4_b2;
+                    4'd3: slot_byte = h_s4_b3; 4'd4: slot_byte = h_s4_b4; 4'd5: slot_byte = h_s4_b5;
+                    4'd6: slot_byte = h_s4_b6; 4'd7: slot_byte = {7'b0, h_s4_addr_bit}; 4'd8: slot_byte = h_s4_crc;
+                    default: slot_byte = 8'h00; endcase end
+                4'd5: begin case (byte_idx)
+                    4'd0: slot_byte = h_s5_b0; 4'd1: slot_byte = h_s5_b1; 4'd2: slot_byte = h_s5_b2;
+                    4'd3: slot_byte = h_s5_b3; 4'd4: slot_byte = h_s5_b4; 4'd5: slot_byte = h_s5_b5;
+                    4'd6: slot_byte = h_s5_b6; 4'd7: slot_byte = {7'b0, h_s5_addr_bit}; 4'd8: slot_byte = h_s5_crc;
+                    default: slot_byte = 8'h00; endcase end
+
+                4'd6: begin case (byte_idx)
+                    4'd0: slot_byte = j_s0_b0; 4'd1: slot_byte = j_s0_b1; 4'd2: slot_byte = j_s0_b2;
+                    4'd3: slot_byte = j_s0_b3; 4'd4: slot_byte = j_s0_b4; 4'd5: slot_byte = j_s0_b5;
+                    4'd6: slot_byte = j_s0_b6; 4'd7: slot_byte = {7'b0, j_s0_addr_bit}; 4'd8: slot_byte = j_s0_crc;
+                    default: slot_byte = 8'h00; endcase end
+                4'd7: begin case (byte_idx)
+                    4'd0: slot_byte = j_s1_b0; 4'd1: slot_byte = j_s1_b1; 4'd2: slot_byte = j_s1_b2;
+                    4'd3: slot_byte = j_s1_b3; 4'd4: slot_byte = j_s1_b4; 4'd5: slot_byte = j_s1_b5;
+                    4'd6: slot_byte = j_s1_b6; 4'd7: slot_byte = {7'b0, j_s1_addr_bit}; 4'd8: slot_byte = j_s1_crc;
+                    default: slot_byte = 8'h00; endcase end
+                4'd8: begin case (byte_idx)
+                    4'd0: slot_byte = j_s2_b0; 4'd1: slot_byte = j_s2_b1; 4'd2: slot_byte = j_s2_b2;
+                    4'd3: slot_byte = j_s2_b3; 4'd4: slot_byte = j_s2_b4; 4'd5: slot_byte = j_s2_b5;
+                    4'd6: slot_byte = j_s2_b6; 4'd7: slot_byte = {7'b0, j_s2_addr_bit}; 4'd8: slot_byte = j_s2_crc;
+                    default: slot_byte = 8'h00; endcase end
+                4'd9: begin case (byte_idx)
+                    4'd0: slot_byte = j_s3_b0; 4'd1: slot_byte = j_s3_b1; 4'd2: slot_byte = j_s3_b2;
+                    4'd3: slot_byte = j_s3_b3; 4'd4: slot_byte = j_s3_b4; 4'd5: slot_byte = j_s3_b5;
+                    4'd6: slot_byte = j_s3_b6; 4'd7: slot_byte = {7'b0, j_s3_addr_bit}; 4'd8: slot_byte = j_s3_crc;
+                    default: slot_byte = 8'h00; endcase end
+                4'd10: begin case (byte_idx)
+                    4'd0: slot_byte = j_s4_b0; 4'd1: slot_byte = j_s4_b1; 4'd2: slot_byte = j_s4_b2;
+                    4'd3: slot_byte = j_s4_b3; 4'd4: slot_byte = j_s4_b4; 4'd5: slot_byte = j_s4_b5;
+                    4'd6: slot_byte = j_s4_b6; 4'd7: slot_byte = {7'b0, j_s4_addr_bit}; 4'd8: slot_byte = j_s4_crc;
+                    default: slot_byte = 8'h00; endcase end
+                4'd11: begin case (byte_idx)
+                    4'd0: slot_byte = j_s5_b0; 4'd1: slot_byte = j_s5_b1; 4'd2: slot_byte = j_s5_b2;
+                    4'd3: slot_byte = j_s5_b3; 4'd4: slot_byte = j_s5_b4; 4'd5: slot_byte = j_s5_b5;
+                    4'd6: slot_byte = j_s5_b6; 4'd7: slot_byte = {7'b0, j_s5_addr_bit}; 4'd8: slot_byte = j_s5_crc;
+                    default: slot_byte = 8'h00; endcase end
+                default: slot_byte = 8'h00;
+            endcase
+        end
+    endfunction
+
+    // Convert a packed 72-bit FIFO frame into byte stream order for SPI reads.
+    function [7:0] frame_word_byte;
+        input [71:0] frame_word;
+        input [3:0] byte_idx;
+        begin
+            case (byte_idx)
+                4'd0: frame_word_byte = frame_word[7:0];
+                4'd1: frame_word_byte = frame_word[15:8];
+                4'd2: frame_word_byte = frame_word[23:16];
+                4'd3: frame_word_byte = frame_word[31:24];
+                4'd4: frame_word_byte = frame_word[39:32];
+                4'd5: frame_word_byte = frame_word[47:40];
+                4'd6: frame_word_byte = frame_word[55:48];
+                4'd7: frame_word_byte = frame_word[63:56];
+                4'd8: frame_word_byte = frame_word[71:64];
+                default: frame_word_byte = 8'h00;
+            endcase
+        end
+    endfunction
+
+    // Synchronize external SPI pins into the system clock domain.
+    always @(posedge clk) begin
+        spi_cs_sync <= {spi_cs_sync[1:0], spi_cs_n};
+        spi_sclk_sync <= {spi_sclk_sync[1:0], spi_sclk};
+        spi_mosi_sync <= {spi_mosi_sync[0], spi_mosi};
+    end
+
+    // Central FIFO manager.
+    // Priority order:
+    // 1) hard reset request
+    // 2) "read done" consume step after SPI snapshot transfer
+    // 3) live frame pushes from H or J channel
+    // Frames arriving while SPI is reading are preserved because SPI reads from
+    // a snapshotted read pointer/count and consumption happens only on CS rise.
+    always @(posedge clk) begin
+        if (fifo_reset_req) begin
+            fifo_wr_ptr <= 4'd0;
+            fifo_rd_ptr <= 4'd0;
+            fifo_count  <= 7'd0;
+            fifo_missed <= 16'd0;
+        end else if (fifo_read_done_req) begin
+            // Snapshot/Consume: advance rd_ptr by the snapshotted count only.
+            // Frames pushed during the SPI transfer are preserved in the FIFO.
+            fifo_rd_ptr <= fifo_rd_ptr + spi_fifo_count_snap[3:0];
+            fifo_count  <= fifo_count - spi_fifo_count_snap;
+            fifo_missed <= 16'd0;
+        end else begin
+            // Accept new frames at all times; only a full FIFO incurs missed.
+            if (fifo_push_req_h) begin
+                if (fifo_count < FIFO_DEPTH) begin
+                    fifo_mem[fifo_wr_ptr] <= fifo_push_word_h;
+                    fifo_wr_ptr <= fifo_wr_ptr + 1'b1;
+                    fifo_count  <= fifo_count + 1'b1;
+                end else begin
+                    fifo_missed <= fifo_missed + 1'b1;
+                end
+            end else if (fifo_push_req_j) begin
+                if (fifo_count < FIFO_DEPTH) begin
+                    fifo_mem[fifo_wr_ptr] <= fifo_push_word_j;
+                    fifo_wr_ptr <= fifo_wr_ptr + 1'b1;
+                    fifo_count  <= fifo_count + 1'b1;
+                end else begin
+                    fifo_missed <= fifo_missed + 1'b1;
+                end
+            end
+        end
+    end
+
+    // H1 receiver FSM:
+    // - Detect falling edge as potential start bit.
+    // - Sample in the middle of each bit period.
+    // - Capture 8 data bits LSB-first, then MDB bit, then verify stop bit.
+    // - Emit one-cycle h_byte_valid pulse with "after gap" marker.
+    always @(posedge clk) begin
+        h_byte_valid <= 1'b0;
+        h_byte_after_gap <= 1'b0;
+        h_prev <= h1_in;
+
+        case (h_state)
+            RX_IDLE: begin
+                if (h1_in) begin
+                    if (h_idle_ticks != 14'h3FFF)
+                        h_idle_ticks <= h_idle_ticks + 1'b1;
+                end else if (h_prev) begin
+                    h_state <= RX_START;
+                    h_timer <= RX_HALF_BIT - 1;
+                    h_start_after_gap <= (h_idle_ticks >= FRAME_GAP_TICKS);
+                    h_idle_ticks <= 0;
+                end
+            end
+            RX_START: begin
+                if (h_timer == 0) begin
+                    if (!h1_in) begin
+                        h_state <= RX_DATA;
+                        h_timer <= RX_BIT_TICKS - 1;
+                        h_bit   <= 0;
+                        h_shift <= 0;
+                    end else begin
+                        h_state <= RX_IDLE;
+                    end
+                    h_idle_ticks <= 0;
+                end else begin
+                    h_timer <= h_timer - 1'b1;
+                    h_idle_ticks <= 0;
+                end
+            end
+            RX_DATA: begin
+                if (h_timer == 0) begin
+                    h_shift <= {h1_in, h_shift[7:1]};
+                    h_timer <= RX_BIT_TICKS - 1;
+                    if (h_bit == 3'd7)
+                        h_state <= RX_MDB;
+                    else
+                        h_bit <= h_bit + 1'b1;
+                end else begin
+                    h_timer <= h_timer - 1'b1;
+                    h_idle_ticks <= 0;
+                end
+            end
+            RX_MDB: begin
+                if (h_timer == 0) begin
+                    h_mdb <= h1_in;
+                    h_state <= RX_STOP;
+                    h_timer <= RX_BIT_TICKS - 1;
+                end else begin
+                    h_timer <= h_timer - 1'b1;
+                    h_idle_ticks <= 0;
+                end
+            end
+            RX_STOP: begin
+                if (h_timer == 0) begin
+                    if (h1_in) begin
+                        h_byte <= h_shift;
+                        h_byte_valid <= 1'b1;
+                        h_byte_after_gap <= h_start_after_gap;
+                    end
+                    h_start_after_gap <= 1'b0;
+                    h_state <= RX_IDLE;
+                end else begin
+                    h_timer <= h_timer - 1'b1;
+                    h_idle_ticks <= 0;
+                end
+            end
+        endcase
+    end
+
+    // J1 receiver FSM (same logic as H1, fully independent).
+    always @(posedge clk) begin
+        j_byte_valid <= 1'b0;
+        j_byte_after_gap <= 1'b0;
+        j_prev <= j1_in;
+
+        case (j_state)
+            RX_IDLE: begin
+                if (j1_in) begin
+                    if (j_idle_ticks != 14'h3FFF)
+                        j_idle_ticks <= j_idle_ticks + 1'b1;
+                end else if (j_prev) begin
+                    j_state <= RX_START;
+                    j_timer <= RX_HALF_BIT - 1;
+                    j_start_after_gap <= (j_idle_ticks >= FRAME_GAP_TICKS);
+                    j_idle_ticks <= 0;
+                end
+            end
+            RX_START: begin
+                if (j_timer == 0) begin
+                    if (!j1_in) begin
+                        j_state <= RX_DATA;
+                        j_timer <= RX_BIT_TICKS - 1;
+                        j_bit   <= 0;
+                        j_shift <= 0;
+                    end else begin
+                        j_state <= RX_IDLE;
+                    end
+                    j_idle_ticks <= 0;
+                end else begin
+                    j_timer <= j_timer - 1'b1;
+                    j_idle_ticks <= 0;
+                end
+            end
+            RX_DATA: begin
+                if (j_timer == 0) begin
+                    j_shift <= {j1_in, j_shift[7:1]};
+                    j_timer <= RX_BIT_TICKS - 1;
+                    if (j_bit == 3'd7)
+                        j_state <= RX_MDB;
+                    else
+                        j_bit <= j_bit + 1'b1;
+                end else begin
+                    j_timer <= j_timer - 1'b1;
+                    j_idle_ticks <= 0;
+                end
+            end
+            RX_MDB: begin
+                if (j_timer == 0) begin
+                    j_mdb <= j1_in;
+                    j_state <= RX_STOP;
+                    j_timer <= RX_BIT_TICKS - 1;
+                end else begin
+                    j_timer <= j_timer - 1'b1;
+                    j_idle_ticks <= 0;
+                end
+            end
+            RX_STOP: begin
+                if (j_timer == 0) begin
+                    if (j1_in) begin
+                        j_byte <= j_shift;
+                        j_byte_valid <= 1'b1;
+                        j_byte_after_gap <= j_start_after_gap;
+                    end
+                    j_start_after_gap <= 1'b0;
+                    j_state <= RX_IDLE;
+                end else begin
+                    j_timer <= j_timer - 1'b1;
+                    j_idle_ticks <= 0;
+                end
+            end
+        endcase
+    end
+
+    // H1 frame assembler and address-slot updater.
+    // When a new frame starts after an idle gap, B0 initializes the frame.
+    // After byte 7 arrives, CRC is checked; valid frames are pushed to FIFO
+    // and copied into the corresponding persistent slot selected by B0 address.
+    always @(posedge clk) begin
+        fifo_push_req_h <= 1'b0;
+        if (h_byte_valid) begin
+            if (h_byte_after_gap) begin
+                h_frame_active <= 1'b1;
+                h_frame_count <= 3'd1;
+                h_frame_b0 <= h_byte;
+                h_frame_b1 <= 8'h00; h_frame_b2 <= 8'h00; h_frame_b3 <= 8'h00;
+                h_frame_b4 <= 8'h00; h_frame_b5 <= 8'h00; h_frame_b6 <= 8'h00;
+                h_frame_addr_bit <= h_mdb;
+            end else if (h_frame_active) begin
+                case (h_frame_count)
+                    3'd1: h_frame_b1 <= h_byte;
+                    3'd2: h_frame_b2 <= h_byte;
+                    3'd3: h_frame_b3 <= h_byte;
+                    3'd4: h_frame_b4 <= h_byte;
+                    3'd5: h_frame_b5 <= h_byte;
+                    3'd6: h_frame_b6 <= h_byte;
+                    default: ;
+                endcase
+
+                if (h_frame_count == 3'd6) begin
+                    h_frame_active <= 1'b0;
+                    h_frame_count <= 3'd0;
+                    if (h_byte == h_frame_crc_calc) begin
+                        fifo_push_req_h <= 1'b1;
+                        fifo_push_word_h <= {h_frame_crc_calc, {7'b0, h_frame_addr_bit}, h_byte, h_frame_b5, h_frame_b4, h_frame_b3, h_frame_b2, h_frame_b1, h_frame_b0};
+                        case (h_frame_b0)
+                            ADDR_10: begin h_s0_valid <= 1'b1; h_s0_b0 <= h_frame_b0; h_s0_b1 <= h_frame_b1; h_s0_b2 <= h_frame_b2; h_s0_b3 <= h_frame_b3; h_s0_b4 <= h_frame_b4; h_s0_b5 <= h_frame_b5; h_s0_b6 <= h_byte; h_s0_addr_bit <= h_frame_addr_bit; h_s0_crc <= h_frame_crc_calc; end
+                            ADDR_08: begin h_s1_valid <= 1'b1; h_s1_b0 <= h_frame_b0; h_s1_b1 <= h_frame_b1; h_s1_b2 <= h_frame_b2; h_s1_b3 <= h_frame_b3; h_s1_b4 <= h_frame_b4; h_s1_b5 <= h_frame_b5; h_s1_b6 <= h_byte; h_s1_addr_bit <= h_frame_addr_bit; h_s1_crc <= h_frame_crc_calc; end
+                            ADDR_11: begin h_s2_valid <= 1'b1; h_s2_b0 <= h_frame_b0; h_s2_b1 <= h_frame_b1; h_s2_b2 <= h_frame_b2; h_s2_b3 <= h_frame_b3; h_s2_b4 <= h_frame_b4; h_s2_b5 <= h_frame_b5; h_s2_b6 <= h_byte; h_s2_addr_bit <= h_frame_addr_bit; h_s2_crc <= h_frame_crc_calc; end
+                            ADDR_09: begin h_s3_valid <= 1'b1; h_s3_b0 <= h_frame_b0; h_s3_b1 <= h_frame_b1; h_s3_b2 <= h_frame_b2; h_s3_b3 <= h_frame_b3; h_s3_b4 <= h_frame_b4; h_s3_b5 <= h_frame_b5; h_s3_b6 <= h_byte; h_s3_addr_bit <= h_frame_addr_bit; h_s3_crc <= h_frame_crc_calc; end
+                            ADDR_12: begin h_s4_valid <= 1'b1; h_s4_b0 <= h_frame_b0; h_s4_b1 <= h_frame_b1; h_s4_b2 <= h_frame_b2; h_s4_b3 <= h_frame_b3; h_s4_b4 <= h_frame_b4; h_s4_b5 <= h_frame_b5; h_s4_b6 <= h_byte; h_s4_addr_bit <= h_frame_addr_bit; h_s4_crc <= h_frame_crc_calc; end
+                            ADDR_0A: begin h_s5_valid <= 1'b1; h_s5_b0 <= h_frame_b0; h_s5_b1 <= h_frame_b1; h_s5_b2 <= h_frame_b2; h_s5_b3 <= h_frame_b3; h_s5_b4 <= h_frame_b4; h_s5_b5 <= h_frame_b5; h_s5_b6 <= h_byte; h_s5_addr_bit <= h_frame_addr_bit; h_s5_crc <= h_frame_crc_calc; end
+                            default: ;
+                        endcase
+                    end
+                end else begin
+                    h_frame_count <= h_frame_count + 1'b1;
+                end
+            end
+        end
+    end
+
+    // J1 frame assembler and slot updater (mirrors H1 behavior).
+    always @(posedge clk) begin
+        fifo_push_req_j <= 1'b0;
+        if (j_byte_valid) begin
+            if (j_byte_after_gap) begin
+                j_frame_active <= 1'b1;
+                j_frame_count <= 3'd1;
+                j_frame_b0 <= j_byte;
+                j_frame_b1 <= 8'h00; j_frame_b2 <= 8'h00; j_frame_b3 <= 8'h00;
+                j_frame_b4 <= 8'h00; j_frame_b5 <= 8'h00; j_frame_b6 <= 8'h00;
+                j_frame_addr_bit <= j_mdb;
+            end else if (j_frame_active) begin
+                case (j_frame_count)
+                    3'd1: j_frame_b1 <= j_byte;
+                    3'd2: j_frame_b2 <= j_byte;
+                    3'd3: j_frame_b3 <= j_byte;
+                    3'd4: j_frame_b4 <= j_byte;
+                    3'd5: j_frame_b5 <= j_byte;
+                    3'd6: j_frame_b6 <= j_byte;
+                    default: ;
+                endcase
+
+                if (j_frame_count == 3'd6) begin
+                    j_frame_active <= 1'b0;
+                    j_frame_count <= 3'd0;
+                    if (j_byte == j_frame_crc_calc) begin
+                        fifo_push_req_j <= 1'b1;
+                        fifo_push_word_j <= {j_frame_crc_calc, {7'b0, j_frame_addr_bit}, j_byte, j_frame_b5, j_frame_b4, j_frame_b3, j_frame_b2, j_frame_b1, j_frame_b0};
+                        case (j_frame_b0)
+                            ADDR_10: begin j_s0_valid <= 1'b1; j_s0_b0 <= j_frame_b0; j_s0_b1 <= j_frame_b1; j_s0_b2 <= j_frame_b2; j_s0_b3 <= j_frame_b3; j_s0_b4 <= j_frame_b4; j_s0_b5 <= j_frame_b5; j_s0_b6 <= j_byte; j_s0_addr_bit <= j_frame_addr_bit; j_s0_crc <= j_frame_crc_calc; end
+                            ADDR_08: begin j_s1_valid <= 1'b1; j_s1_b0 <= j_frame_b0; j_s1_b1 <= j_frame_b1; j_s1_b2 <= j_frame_b2; j_s1_b3 <= j_frame_b3; j_s1_b4 <= j_frame_b4; j_s1_b5 <= j_frame_b5; j_s1_b6 <= j_byte; j_s1_addr_bit <= j_frame_addr_bit; j_s1_crc <= j_frame_crc_calc; end
+                            ADDR_11: begin j_s2_valid <= 1'b1; j_s2_b0 <= j_frame_b0; j_s2_b1 <= j_frame_b1; j_s2_b2 <= j_frame_b2; j_s2_b3 <= j_frame_b3; j_s2_b4 <= j_frame_b4; j_s2_b5 <= j_frame_b5; j_s2_b6 <= j_byte; j_s2_addr_bit <= j_frame_addr_bit; j_s2_crc <= j_frame_crc_calc; end
+                            ADDR_09: begin j_s3_valid <= 1'b1; j_s3_b0 <= j_frame_b0; j_s3_b1 <= j_frame_b1; j_s3_b2 <= j_frame_b2; j_s3_b3 <= j_frame_b3; j_s3_b4 <= j_frame_b4; j_s3_b5 <= j_frame_b5; j_s3_b6 <= j_byte; j_s3_addr_bit <= j_frame_addr_bit; j_s3_crc <= j_frame_crc_calc; end
+                            ADDR_12: begin j_s4_valid <= 1'b1; j_s4_b0 <= j_frame_b0; j_s4_b1 <= j_frame_b1; j_s4_b2 <= j_frame_b2; j_s4_b3 <= j_frame_b3; j_s4_b4 <= j_frame_b4; j_s4_b5 <= j_frame_b5; j_s4_b6 <= j_byte; j_s4_addr_bit <= j_frame_addr_bit; j_s4_crc <= j_frame_crc_calc; end
+                            ADDR_0A: begin j_s5_valid <= 1'b1; j_s5_b0 <= j_frame_b0; j_s5_b1 <= j_frame_b1; j_s5_b2 <= j_frame_b2; j_s5_b3 <= j_frame_b3; j_s5_b4 <= j_frame_b4; j_s5_b5 <= j_frame_b5; j_s5_b6 <= j_byte; j_s5_addr_bit <= j_frame_addr_bit; j_s5_crc <= j_frame_crc_calc; end
+                            default: ;
+                        endcase
+                    end
+                end else begin
+                    j_frame_count <= j_frame_count + 1'b1;
+                end
+            end
+        end
+    end
+
+    // Periodic UART packet transmitter.
+    // Every SEND_TICKS, stream 12 slots x 9 bytes as serial 8N1 bytes.
+    // tx_shift contains one framed UART symbol: {stop, data[7:0], start}.
+    always @(posedge clk) begin
+        if (send_timer == SEND_TICKS - 1) begin
+            send_timer <= 0;
+            pkt_pending <= 1'b1;
+        end else begin
+            send_timer <= send_timer + 1'b1;
+        end
+
+        if (!tx_active && !tx_packet_active && pkt_pending) begin
+            tx_packet_active <= 1'b1;
+            tx_slot_idx <= 0;
+            tx_byte_idx <= 0;
+            tx_shift <= {1'b1, slot_byte(4'd0, 4'd0), 1'b0};
+            tx_timer <= 0;
+            tx_bits_left <= 4'd10;
+            tx_active <= 1'b1;
+            pkt_pending <= 1'b0;
+        end
+
+        if (tx_active) begin
+            if (tx_timer == 0) begin
+                tx <= tx_shift[0];
+                tx_shift <= {1'b1, tx_shift[9:1]};
+                tx_timer <= TX_TICKS - 1;
+                tx_bits_left <= tx_bits_left - 1'b1;
+
+                if (tx_bits_left == 4'd1) begin
+                    tx_active <= 1'b0;
+
+                    if (tx_packet_active) begin
+                        if ((tx_slot_idx == 4'd11) && (tx_byte_idx == 4'd8)) begin
+                            tx_packet_active <= 1'b0;
+                        end else begin
+                            tx_active <= 1'b1;
+                            tx_bits_left <= 4'd10;
+                            if (tx_byte_idx == 4'd8) begin
+                                tx_slot_idx <= tx_slot_idx + 1'b1;
+                                tx_byte_idx <= 0;
+                                tx_shift <= {1'b1, slot_byte(tx_slot_idx + 1'b1, 4'd0), 1'b0};
+                            end else begin
+                                tx_byte_idx <= tx_byte_idx + 1'b1;
+                                tx_shift <= {1'b1, slot_byte(tx_slot_idx, tx_byte_idx + 1'b1), 1'b0};
+                            end
+                        end
+                    end
+                end
+            end else begin
+                tx_timer <= tx_timer - 1'b1;
+            end
+        end else begin
+            tx <= 1'b1;
+        end
+    end
+
+    // SPI command engine:
+    // - A0: reset FIFO, return 0xA5
+    // - A1: read FIFO snapshot (missed_lo, missed_hi, count, frame bytes...)
+    // - A2: read all 12 persistent slots (last-known values)
+    // Data is shifted MSB-first on MISO and sampled on SCLK edges after sync.
+    always @(posedge clk) begin
+        fifo_reset_req <= 1'b0;
+        fifo_read_done_req <= 1'b0;
+
+        if (spi_cs_fall) begin
+            spi_bit_cnt <= 3'd0;
+            spi_rx_shift <= 8'h00;
+            spi_tx_byte <= 8'h00;
+            spi_miso <= 1'b0;
+            spi_cmd_seen <= 1'b0;
+            spi_cmd <= 8'h00;
+            spi_mode <= 2'd0;
+            spi_fifo_phase <= 2'd0;
+            spi_fifo_frame_idx <= 7'd0;
+            spi_fifo_byte_idx <= 4'd0;
+            spi_last_slot_idx <= 4'd0;
+            spi_last_byte_idx <= 4'd0;
+        end
+
+        if (!spi_cs_now && spi_sclk_fall) begin
+            spi_miso <= spi_tx_byte[7 - spi_bit_cnt];
+        end
+
+        if (!spi_cs_now && spi_sclk_rise) begin
+            spi_rx_shift <= {spi_rx_shift[6:0], spi_mosi_sync[1]};
+
+            if (spi_bit_cnt == 3'd7) begin
+                spi_rx_byte <= {spi_rx_shift[6:0], spi_mosi_sync[1]};
+                spi_bit_cnt <= 3'd0;
+
+                if (!spi_cmd_seen) begin
+                    spi_cmd_seen <= 1'b1;
+                    spi_cmd <= {spi_rx_shift[6:0], spi_mosi_sync[1]};
+
+                    case ({spi_rx_shift[6:0], spi_mosi_sync[1]})
+                        SPI_CMD_RESET_FIFO: begin
+                            fifo_reset_req <= 1'b1;
+                            spi_mode <= 2'd0;
+                            spi_tx_byte <= 8'hA5;
+                        end
+
+                        SPI_CMD_READ_FIFO: begin
+                            spi_mode <= 2'd1;
+                            spi_fifo_count_snap <= fifo_count;
+                            spi_fifo_missed_snap <= fifo_missed;
+                            spi_fifo_rd_ptr_snap <= fifo_rd_ptr;
+                            spi_fifo_phase <= 2'd1;
+                            spi_fifo_frame_idx <= 7'd0;
+                            spi_fifo_byte_idx <= 4'd0;
+                            spi_tx_byte <= fifo_missed[7:0];
+                        end
+
+                        SPI_CMD_READ_LAST: begin
+                            spi_mode <= 2'd2;
+                            spi_last_slot_idx <= 4'd0;
+                            spi_last_byte_idx <= 4'd1;
+                            spi_tx_byte <= slot_byte(4'd0, 4'd0);
+                        end
+
+                        default: begin
+                            spi_mode <= 2'd0;
+                            spi_tx_byte <= 8'hEE;
+                        end
+                    endcase
+                end else begin
+                    case (spi_mode)
+                        2'd1: begin
+                            case (spi_fifo_phase)
+                                2'd1: begin
+                                    spi_tx_byte <= spi_fifo_missed_snap[15:8];
+                                    spi_fifo_phase <= 2'd2;
+                                end
+
+                                2'd2: begin
+                                    spi_tx_byte <= {1'b0, spi_fifo_count_snap};
+                                    spi_fifo_phase <= 2'd3;
+                                end
+
+                                default: begin
+                                    if (spi_fifo_frame_idx < spi_fifo_count_snap) begin
+                                        spi_tx_byte <= frame_word_byte(
+                                            fifo_mem[spi_fifo_rd_ptr_snap + spi_fifo_frame_idx[3:0]],
+                                            spi_fifo_byte_idx
+                                        );
+
+                                        if (spi_fifo_byte_idx == 4'd8) begin
+                                            spi_fifo_byte_idx <= 4'd0;
+                                            spi_fifo_frame_idx <= spi_fifo_frame_idx + 1'b1;
+                                        end else begin
+                                            spi_fifo_byte_idx <= spi_fifo_byte_idx + 1'b1;
+                                        end
+                                    end else begin
+                                        spi_tx_byte <= 8'h00;
+                                    end
+                                end
+                            endcase
+                        end
+
+                        2'd2: begin
+                            if (spi_last_slot_idx < 4'd12) begin
+                                spi_tx_byte <= slot_byte(spi_last_slot_idx, spi_last_byte_idx);
+
+                                if (spi_last_byte_idx == 4'd8) begin
+                                    spi_last_byte_idx <= 4'd0;
+                                    spi_last_slot_idx <= spi_last_slot_idx + 1'b1;
+                                end else begin
+                                    spi_last_byte_idx <= spi_last_byte_idx + 1'b1;
+                                end
+                            end else begin
+                                spi_tx_byte <= 8'h00;
+                            end
+                        end
+
+                        default: begin
+                            spi_tx_byte <= 8'h00;
+                        end
+                    endcase
+                end
+            end else begin
+                spi_bit_cnt <= spi_bit_cnt + 1'b1;
+            end
+        end
+
+        if (spi_cs_rise) begin
+            if (spi_mode == 2'd1) begin
+                fifo_read_done_req <= 1'b1;
+            end
+        end
+    end
+
+    // Keep otherwise status-only registers from being optimized away while still
+    // avoiding lint warnings for intentionally-unused signals.
+    wire _unused = h_s0_valid ^ h_s1_valid ^ h_s2_valid ^ h_s3_valid ^ h_s4_valid ^ h_s5_valid ^
+                   j_s0_valid ^ j_s1_valid ^ j_s2_valid ^ j_s3_valid ^ j_s4_valid ^ j_s5_valid ^
+                   spi_cmd[0] ^ spi_rx_byte[0];
+
+endmodule
