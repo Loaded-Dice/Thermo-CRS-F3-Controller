@@ -104,17 +104,17 @@ Timing overview for repetitive position query/control:
 
 //Master Request Line				//Slave Response Line
 
-10 {Rest-Frame}		->	~30uS	->		10 {Rest-Frame}	
+0x10 {Rest-Frame}		->	~30uS	->		0x10 {Rest-Frame}	
 Short Pause ~ 500uS
-08 {Rest-Frame}		->	~30uS	->		08 {Rest-Frame}	
+0x08 {Rest-Frame}		->	~30uS	->		0x08 {Rest-Frame}	
 Mid pause   ~ 1500µS
-11 {Rest-Frame}		->	~30uS	->		11 {Rest-Frame}	
+0x11 {Rest-Frame}		->	~30uS	->		0x11 {Rest-Frame}	
 Short Pause ~ 500uS
-09 {Rest-Frame}		->	~30uS	->		09 {Rest-Frame}	
+0x09 {Rest-Frame}		->	~30uS	->		0x09 {Rest-Frame}	
 Mid pause   ~ 1500µS
-10 {Rest-Frame}		->	~30uS	->		10 {Rest-Frame}	
+0x12 {Rest-Frame}		->	~30uS	->		0x12 {Rest-Frame}	
 Short Pause ~ 500uS
-08 {Rest-Frame}		->	~30uS	->		08 {Rest-Frame}	
+0x0A {Rest-Frame}		->	~30uS	->		0x0A {Rest-Frame}	
 Long pause ~ ~5500µS
 
 The master sends requests in the shown rhythm (with tolerance ~+- 10us).
@@ -372,27 +372,215 @@ When no new info arrives, the main loop should continue.
  - Either robot has set-point authority and sets the current position which is used for the next get position requests
  - or FPGA still has set-point authority and then it sends the last valid position data, regardless of what other positions the robot sends
  
-iCE40|	Function
-Pins |
------|---------------------
-E14	 | MAX3485 En (Master)		must be HIGH
-F12  | MAX3485 Tx (Master)  
-G14  | MAX3485 Rx (Slave )	(G14 = IOR_141_GBIN2 --> Global Buffer Inputs)
-H12  | MAX3485 En (Slave )		must be LOW
-G1   | SPI SCK (to ESP32)
-H1   | SPI MOSI (to ESP32)
-J1   | SPI CS (to ESP32)
-L1   | SPI MISO (to ESP32)
-P7   | internal FPGA-Clock (clk_12m)
------+----------------------
+=========================================================================================
+IMPLEMENTED BUFFER ARCHITECTURE (Per-Node Copy on Send)  & AUTHORITY CONTROL
+=========================================================================================
+
+output frame buffer for all 6 setpoint frames 
+	- Each frame is sent from its own source based on authority and timing
+	- Robot authority: uses shadow_positions (auto-updated from response)
+	- ESP authority: uses esp2fpga_buffer (written by ESP via SPI)
+
+slave input frame buffer for all 6 setpoint frame responses (response_slots)
+	- Always filled by robot responses
+	- Never cleared, only overwritten by new valid data
+	- Always readable by ESP (Following error and status always visible)
+	- Valid mask indicates which slots contain valid CRC-checked data
+
+ESP2FPGA input frame buffers for all 6 setpoint frames (esp2fpga_buffer[0:41])
+	- 6 nodes × 7 bytes = 42 bytes total
+	- Each node has writeable flag: 1=ready to write, 0=blocked (being sent)
+	- Writing process:
+		1. ESP checks writeable flag via SPI_CMD_GET_AUTH_STATE
+		2. ESP writes frame via SPI_CMD_WRITE_POSITION
+		3. Flag automatically clears when write completes
+		4. FPGA copies buffer to output IMMEDIATELY BEFORE sending
+		5. Flag automatically sets after copy (buffer available again)
+	- Race condition IMPOSSIBLE: Each buffer copied individually before use
+	- Large time windows: 470us (short) to 1470us (mid) per frame
+
+//-----------------------------------------
+
+output frame buffer for one Extra Frame (esp2fpga_buffer[42:48])
+	- 1 extra node × 7 bytes = 7 bytes
+	- NodeID 0x20 (Gripper/Reset/Custom commands)
+	- Same writeable flag mechanism as position frames
+	- Inserted during long pause when buffer contains valid data
+	- Not looped, cleared after sending
+
+ESP2FPGA input frame buffer for one Extra Frame 
+	- Written via SPI_CMD_WRITE_EXTRA
+	- Automatically copied and cleared when sent
+	- Independent from authority (can re-home when robot positioned manually)
+
+slave input frame buffer for one Extra Frame response
+	- Filled by direct response following Extra Frame request
+	- Must arrive within typical timeout (~400us)
+	- Only cleared when new ESP2FPGA extra frame written
+	- Makes response re-readable
+
+//-----------------------------------------
+
+Authority Control System
+
+Authority state (esp_has_authority):
+	- 0 = Robot has authority (default, init, safe mode)
+	- 1 = ESP has authority (motors armed, ESP controls motion)
+
+SPI Commands:
+	- 0xB4 GET_AUTH_STATE: Returns {authority_bit, writeable[6:0]}
+		bit 7: 0=Robot authority, 1=ESP authority
+		bit 6: Node 0x20 (extra) writeable
+		bit 5: Node 0x0A writeable
+		bit 4: Node 0x12 writeable
+		bit 3: Node 0x09 writeable
+		bit 2: Node 0x11 writeable
+		bit 1: Node 0x08 writeable
+		bit 0: Node 0x10 writeable
+		
+	- 0xB5 TAKE_AUTHORITY: ESP takes control
+		→ Sets esp_has_authority = 1
+		→ Sets all writeable flags = 1
+		→ Returns 0xA5 on success
+		
+	- 0xB6 RETURN_AUTHORITY: Robot resumes control
+		→ Sets esp_has_authority = 0
+		→ Returns 0xA5 on success
+		
+	- 0xB7 WRITE_POSITION: Write position frame for node 0-5
+		Format: {CMD, nodeIndex, 7_frame_bytes}
+		→ Writes to esp2fpga_buffer[nodeIndex*7 : nodeIndex*7+6]
+		→ Clears writeable flag for that node
+		→ Only accepted if writeable flag was 1
+		
+	- 0xB8 WRITE_EXTRA: Write extra frame (0x20)
+		Format: {CMD, 7_frame_bytes}
+		→ Writes to esp2fpga_buffer[42:48]
+		→ Clears writeable flag[6]
+		→ Only accepted if writeable flag[6] was 1
+
+Implications by Authority State:
+
+Robot has authority (esp_has_authority = 0):
+	- Output frames use shadow_positions (updated from robot responses)
+	- ESP can still READ all responses via SPI
+	- ESP CANNOT write to esp2fpga_buffer (rejected)
+	- Robot smoothly follows manually adjusted positions
+	- Flags byte = 0x26 (motors unarmed, robot in control)
+
+ESP has authority (esp_has_authority = 1):
+	- Output frames copied from esp2fpga_buffer BEFORE each send
+	- Robot responses still stored in response_slots (readable)
+	- ESP MUST write new positions to maintain motion
+	- Each buffer becomes writeable immediately after being copied/sent
+	- Flags byte typically = 0x04 (motors armed, ESP controls)
+
+//-----------------------------------------
+
+Corrected nodeID hex values:
+//Master Request Line						//Slave Response Line
+0x10 {Rest-Frame}		->	~30uS	->		0x10 {Rest-Frame}	
+Short Pause ~ 500uS (copy next buffer, ESP write window: 470us)
+0x08 {Rest-Frame}		->	~30uS	->		0x08 {Rest-Frame}	
+Mid pause   ~ 1500µS (copy next buffer, ESP write window: 1470us)
+0x11 {Rest-Frame}		->	~30uS	->		0x11 {Rest-Frame}	
+Short Pause ~ 500uS (copy next buffer, ESP write window: 470us)
+0x09 {Rest-Frame}		->	~30uS	->		0x09 {Rest-Frame}	
+Mid pause   ~ 1500µS (copy next buffer, ESP write window: 1470us)
+0x12 {Rest-Frame}		->	~30uS	->		0x12 {Rest-Frame}	
+Short Pause ~ 500uS (copy next buffer, ESP write window: 470us)
+0x0A {Rest-Frame}		->	~30uS	->		0x0A {Rest-Frame}	
+Mid pause   ~ 1500µS (copy extra if pending, ESP write window: 1470us)
+[If extra frame pending:]
+0x20 {Extra-Frame}		->	~30uS	->		0x20 {Response}
+Short Pause ~ 500uS
+Long pause to complete 10ms cycle
+Frame-Block-Done pulse on GPIO14 (J3)
+
+
+Error Response:
+No immediate hard abort on individual deviations or set flags.
+Decision authority should be with the ESP32 later
+
+//-----------------------------------------
+
+Pin Assignments:
+
+iCE40 FPGA |	Function
+Pins       |
+-----------|---------------------
+E14	       | MAX3485 En (Master)		must be HIGH
+F12        | MAX3485 Tx (Master)  
+G14        | MAX3485 Rx (Slave)	(G14 = IOR_141_GBIN2 --> Global Buffer Inputs)
+H12        | MAX3485 En (Slave)		must be LOW
+G1         | SPI SCK (to ESP32)
+H1         | SPI MOSI (to ESP32)
+J1         | SPI CS (to ESP32)
+L1         | SPI MISO (to ESP32)
+J3         | Frame-Block-Done (to ESP32)  **CONNECTED**
+P7         | internal FPGA-Clock (clk_12m)
+-----------|---------------------
 
 ESP32  | Function
 Pins   |
--------+-------------------
+-------|-------------------
 GPIO10 | CS SPI (to FPGA)
 GPIO11 | MOSI SPI (to FPGA)
 GPIO12 | SCK SPI (to FPGA)
 GPIO13 | MISO SPI (to FPGA)
+GPIO14 | Frame-Block-Done IRQ (from FPGA)  **CONNECTED**
 
+Free Connected Pins:
+Esp		| FPGA
+Pins	| Pins
+--------|-------
+GPIO21	| H3
+GPIO6 	| G3
 
+//-----------------------------------------
 
+SPI Command Summary:
+
+0xB0 - READ_STATUS (8 bytes)
+	Returns controller status: flags, phase, valid_mask, current_node, timeouts, crc_errors
+
+0xB1 - READ_FRAMES (42 bytes)
+	Returns all 6 response frames from robot (6 nodes × 7 bytes)
+
+0xB2 - START_INIT
+	Triggers initialization sequence
+	Returns: 0xA5 if accepted, 0xEE if rejected
+
+0xB3 - RESET_CTRL
+	Resets controller to IDLE state
+	Returns: 0xA5
+
+0xB4 - GET_AUTH_STATE (1 byte)
+	Returns: {authority_bit[7], writeable_flags[6:0]}
+	Bit 7: 0=Robot authority, 1=ESP authority
+	Bits 6-0: Writeable status for nodes 6,5,4,3,2,1,0 (1=writeable, 0=busy)
+
+0xB5 - TAKE_AUTHORITY
+	ESP takes control of setpoints
+	Returns: 0xA5
+
+0xB6 - RETURN_AUTHORITY
+	Robot resumes control of setpoints
+	Returns: 0xA5
+
+0xB7 - WRITE_POSITION (9 bytes: CMD + node_index + 7 frame bytes)
+	Write position frame for nodes 0-5
+	Format: {0xB7, nodeIndex, NodeID, 0x31, Pos1, Pos2, Pos3, Flags, CRC}
+	Only accepted if writeable flag is 1 and ESP has authority
+
+0xB8 - WRITE_EXTRA (8 bytes: CMD + 7 frame bytes)
+	Write extra frame (NodeID 0x20 for Gripper/Reset/Custom)
+	Format: {0xB8, NodeID, CMD, Data1, Data2, Data3, Flags, CRC}
+	Can be used regardless of authority state
+
+0xB9 - READ_EXTRA (7 bytes)
+	Read extra frame response from robot
+	Returns: 7 bytes of last extra frame response
+	Response persists until new extra frame is sent
+
+//-----------------------------------------

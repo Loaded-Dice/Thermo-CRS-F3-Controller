@@ -1,0 +1,445 @@
+/*
+Serial Commands: 
+get_pos
+get_dh
+J<n> a alpha d offset   (alpha/offset in deg)
+set x y z rx ry rz      (deg, TCP!)
+set_tool x y z rx ry rz (deg)
+set_ik iters lambda
+*/
+
+#include <Arduino.h>
+#include <math.h>
+
+#define NUM_JOINTS 6
+#define DEG2RAD (M_PI / 180.0f)
+#define RAD2DEG (180.0f / M_PI)
+#define RAD(a) (a * M_PI / 180.0f)
+#define DEG(a) (a * 180.0f / M_PI)
+ #define SIZE(a) sizeof(a) / sizeof(a[0])
+/* ===================== Types ===================== */
+
+struct Vec3 {float x,y,z;};
+
+struct Mat4 {float m[4][4];};
+
+struct DH {  float a;  float alpha;  float d;  float offset;  float qmin, qmax;};
+
+/* ===================== Globals ===================== */
+
+
+// //θ_i → d_i → a_i → α_i
+DH dh[NUM_JOINTS] = { // Modified DH-Parameter 
+   // a      alpha       d          angleoff      qmin        qmax
+  {100.0f,  RAD(90) ,    350.0f,      RAD(0) ,    RAD(-180),  RAD(180)}, // J1
+  {265.0f,  RAD(0)  ,         0,      RAD(90),    RAD(-135),   RAD(45)}, // J2
+  {     0,  RAD(90) ,      0.0f,      RAD(90),    RAD(-135),  RAD(135)},  // J3
+  {     0,  RAD(-90),    270.0f,      RAD(0) ,    RAD(-180),  RAD(180)}, // J4
+  {     0,  RAD(90) ,         0,      RAD(0) ,    RAD(-135),  RAD(135)}, // J5
+  {     0,  RAD( 0) ,     90.0f,      RAD(0) ,    RAD(-365),  RAD(365)}  // J6
+};
+
+// array to save IK angles θ 
+float q[NUM_JOINTS] = { // rotation is from home
+  0, //Base Angle  -θ rotate right (towards -Y)
+  0, //Shoulder -θ rotate forward
+  0, //Arm -θ rotate forward
+  0, //Wrist rotation1 -θ rotate right (towards -Y)
+  0, //Wrist Tilt -θ rotate forward 
+  0  //Wrist rotation2 -θ rotate right
+};
+
+// Tool offset (x, y, z) in mm - dynamisch änderbar
+Vec3 tool_offset = {0, 0, 0};
+
+Mat4 T_tool;          // TCP offset (Position + Rotation)
+int   ik_iters  = 10;  // solver iterations 5 … 15
+float ik_lambda = 0.02f; // Damping factor λ = 0.01 … 0.05
+Mat4 T_WB; // Transformation World
+//float joint_angles[NUM_JOINTS] = {0};   // rad, intern
+
+/* ===================== Math Utils ===================== */
+
+Vec3 cross(const Vec3&a,const Vec3&b){  return {a.y*b.z-a.z*b.y,a.z*b.x-a.x*b.z,a.x*b.y-a.y*b.x};}
+
+Vec3 sub(const Vec3&a,const Vec3&b){  return {a.x-b.x,a.y-b.y,a.z-b.z};}
+
+Mat4 identity(){
+  Mat4 T={0};
+  for(int i=0;i<4;i++) T.m[i][i]=1;
+  return T;
+}
+
+Mat4 mul(const Mat4&A,const Mat4&B){
+  Mat4 R={0};
+  for(int i=0;i<4;i++)
+    for(int j=0;j<4;j++)
+      for(int k=0;k<4;k++)
+        R.m[i][j]+=A.m[i][k]*B.m[k][j];
+  return R;
+}
+
+/* ===================== DH / FK ===================== */
+
+
+Mat4 dhMatrix(int i, float q) { // for modified DH
+  const DH& p = dh[i];
+
+  float theta = q + p.offset;
+  float ct = cosf(theta);
+  float st = sinf(theta);
+
+
+  float ca_prev = (i == 0) ? 1.0f : cosf(dh[i-1].alpha); 
+  float sa_prev = (i == 0) ? 0.0f : sinf(dh[i-1].alpha);
+  float a_prev   = (i == 0) ? 0.0f : dh[i-1].a;
+
+  Mat4 T = identity();
+
+  T.m[0][0] =  ct;
+  T.m[0][1] = -st;
+  T.m[0][2] =  0;
+  T.m[0][3] =  a_prev;
+
+  T.m[1][0] =  st * ca_prev;
+  T.m[1][1] =  ct * ca_prev;
+  T.m[1][2] = -sa_prev;
+  T.m[1][3] = -p.d * sa_prev;
+
+  T.m[2][0] =  st * sa_prev;
+  T.m[2][1] =  ct * sa_prev;
+  T.m[2][2] =  ca_prev;
+  T.m[2][3] =  p.d * ca_prev;
+
+  return T;
+}
+
+void forwardAll(const float q[6], Mat4 T[7]){
+  T[0]=identity();
+  for(int i=0;i<6;i++)
+    T[i+1]=mul(T[i],dhMatrix(i,q[i]));
+}
+
+/* ===================== Jacobian ===================== */
+
+// Berechnet Jacobian für TCP-Position (mit Tool-Offset)
+void computeJacobian(const Mat4 T[7], const Mat4& Ttcp, float J[6][6]){
+  Vec3 pe={Ttcp.m[0][3], Ttcp.m[1][3], Ttcp.m[2][3]}; // TCP position
+  for(int i=0;i<6;i++){
+    Vec3 zi={T[i].m[0][2],T[i].m[1][2],T[i].m[2][2]};
+    Vec3 pi={T[i].m[0][3],T[i].m[1][3],T[i].m[2][3]};
+    Vec3 Jv=cross(zi,sub(pe,pi));
+    J[0][i]=Jv.x; J[1][i]=Jv.y; J[2][i]=Jv.z;
+    J[3][i]=zi.x; J[4][i]=zi.y; J[5][i]=zi.z;
+  }
+}
+
+/* ===================== Orientation Error ===================== */
+
+// Berechnet Orientierungsfehler im Welt-Frame
+void orientationError(const Mat4& Tc,const Mat4& Td,float e[3]){
+  // Skew-symmetric part of Rc^T * Rd, dann in Welt-Frame transformieren
+  float nx = Tc.m[0][0]*Td.m[0][0] + Tc.m[1][0]*Td.m[1][0] + Tc.m[2][0]*Td.m[2][0];
+  float ny = Tc.m[0][1]*Td.m[0][1] + Tc.m[1][1]*Td.m[1][1] + Tc.m[2][1]*Td.m[2][1];
+  float nz = Tc.m[0][2]*Td.m[0][2] + Tc.m[1][2]*Td.m[1][2] + Tc.m[2][2]*Td.m[2][2];
+  
+  // Achse-Winkel aus Rotationsmatrix-Differenz (vereinfacht für kleine Winkel)
+  float ex_local = 0.5f * (
+    (Tc.m[1][0]*Td.m[2][0] - Tc.m[2][0]*Td.m[1][0]) +
+    (Tc.m[1][1]*Td.m[2][1] - Tc.m[2][1]*Td.m[1][1]) +
+    (Tc.m[1][2]*Td.m[2][2] - Tc.m[2][2]*Td.m[1][2])
+  );
+  float ey_local = 0.5f * (
+    (Tc.m[2][0]*Td.m[0][0] - Tc.m[0][0]*Td.m[2][0]) +
+    (Tc.m[2][1]*Td.m[0][1] - Tc.m[0][1]*Td.m[2][1]) +
+    (Tc.m[2][2]*Td.m[0][2] - Tc.m[0][2]*Td.m[2][2])
+  );
+  float ez_local = 0.5f * (
+    (Tc.m[0][0]*Td.m[1][0] - Tc.m[1][0]*Td.m[0][0]) +
+    (Tc.m[0][1]*Td.m[1][1] - Tc.m[1][1]*Td.m[0][1]) +
+    (Tc.m[0][2]*Td.m[1][2] - Tc.m[1][2]*Td.m[0][2])
+  );
+  
+  e[0] = ex_local;
+  e[1] = ey_local;
+  e[2] = ez_local;
+}
+
+/* ===================== Matrix Utils für DLS ===================== */
+
+// 6x6 Matrix-Inversion mit Gauss-Jordan (in-place auf augmentierter Matrix)
+bool invert6x6(float A[6][6], float Ainv[6][6]) {
+  // Kopiere A und erstelle Einheitsmatrix
+  float aug[6][12];
+  for(int i=0; i<6; i++) {
+    for(int j=0; j<6; j++) {
+      aug[i][j] = A[i][j];
+      aug[i][j+6] = (i==j) ? 1.0f : 0.0f;
+    }
+  }
+  
+  // Gauss-Jordan Elimination
+  for(int col=0; col<6; col++) {
+    // Finde Pivot (größtes Element in Spalte)
+    int maxRow = col;
+    float maxVal = fabsf(aug[col][col]);
+    for(int row=col+1; row<6; row++) {
+      if(fabsf(aug[row][col]) > maxVal) {
+        maxVal = fabsf(aug[row][col]);
+        maxRow = row;
+      }
+    }
+    
+    // Singulär-Check
+    if(maxVal < 1e-10f) return false;
+    
+    // Zeilen tauschen
+    if(maxRow != col) {
+      for(int k=0; k<12; k++) {
+        float tmp = aug[col][k];
+        aug[col][k] = aug[maxRow][k];
+        aug[maxRow][k] = tmp;
+      }
+    }
+    
+    // Pivot normalisieren
+    float pivot = aug[col][col];
+    for(int k=0; k<12; k++) aug[col][k] /= pivot;
+    
+    // Eliminieren
+    for(int row=0; row<6; row++) {
+      if(row != col) {
+        float factor = aug[row][col];
+        for(int k=0; k<12; k++) aug[row][k] -= factor * aug[col][k];
+      }
+    }
+  }
+  
+  // Ergebnis extrahieren
+  for(int i=0; i<6; i++)
+    for(int j=0; j<6; j++)
+      Ainv[i][j] = aug[i][j+6];
+  
+  return true;
+}
+
+/* ===================== IK Solver (Damped Least Squares) ===================== */
+
+bool solveIK(float q[6], const Mat4& Ttarget) {
+  Mat4 T[7];
+  float J[6][6], e[6];
+  float JJT[6][6], JJTinv[6][6];
+  float lambda2 = ik_lambda * ik_lambda;
+  
+  const float tol_pos = 0.5f;    // 0.5mm Positions-Toleranz
+  const float tol_rot = 0.01f;   // ~0.5° Orientierungs-Toleranz
+  
+  for(int it=0; it<ik_iters; it++) {
+    forwardAll(q, T);
+    Mat4 Ttcp = mul(T[6], T_tool);
+    
+    // Positionsfehler
+    e[0] = Ttarget.m[0][3] - Ttcp.m[0][3];
+    e[1] = Ttarget.m[1][3] - Ttcp.m[1][3];
+    e[2] = Ttarget.m[2][3] - Ttcp.m[2][3];
+    
+    // Orientierungsfehler
+    orientationError(Ttcp, Ttarget, &e[3]);
+    
+    // Konvergenz-Check
+    float err_pos = sqrtf(e[0]*e[0] + e[1]*e[1] + e[2]*e[2]);
+    float err_rot = sqrtf(e[3]*e[3] + e[4]*e[4] + e[5]*e[5]);
+    if(err_pos < tol_pos && err_rot < tol_rot) return true;
+    
+    // Jacobian berechnen (mit TCP)
+    computeJacobian(T, Ttcp, J);
+    
+    // J * J^T + λ²I berechnen
+    for(int i=0; i<6; i++) {
+      for(int j=0; j<6; j++) {
+        float sum = 0;
+        for(int k=0; k<6; k++) sum += J[i][k] * J[j][k];
+        JJT[i][j] = sum + ((i==j) ? lambda2 : 0);
+      }
+    }
+    
+    // (J*J^T + λ²I)^-1 berechnen
+    if(!invert6x6(JJT, JJTinv)) {
+      // Singulär - fallback zu J^T mit Dämpfung
+      for(int i=0; i<6; i++) {
+        float dq = 0;
+        for(int k=0; k<6; k++) dq += J[k][i] * e[k];
+        q[i] += dq * ik_lambda;
+        q[i] = constrain(q[i], dh[i].qmin, dh[i].qmax);
+      }
+      continue;
+    }
+    
+    // Δq = J^T * (J*J^T + λ²I)^-1 * e
+    float y[6] = {0}; // y = JJTinv * e
+    for(int i=0; i<6; i++)
+      for(int k=0; k<6; k++)
+        y[i] += JJTinv[i][k] * e[k];
+    
+    float dq[6] = {0}; // dq = J^T * y
+    for(int i=0; i<6; i++) {
+      for(int k=0; k<6; k++)
+        dq[i] += J[k][i] * y[k];
+      q[i] += dq[i];
+      q[i] = constrain(q[i], dh[i].qmin, dh[i].qmax);
+    }
+  }
+  
+  // Finale Fehlerprüfung
+  forwardAll(q, T);
+  Mat4 Ttcp = mul(T[6], T_tool);
+  float err_pos = sqrtf(
+    powf(Ttarget.m[0][3]-Ttcp.m[0][3], 2) +
+    powf(Ttarget.m[1][3]-Ttcp.m[1][3], 2) +
+    powf(Ttarget.m[2][3]-Ttcp.m[2][3], 2)
+  );
+  
+  return (err_pos < 5.0f); // true wenn innerhalb 5mm
+}
+
+/* ===================== Euler XYZ ===================== */
+
+Mat4 eulerXYZ(float rx,float ry,float rz){
+  rx*=DEG2RAD; ry*=DEG2RAD; rz*=DEG2RAD;
+  float cx=cos(rx),sx=sin(rx);
+  float cy=cos(ry),sy=sin(ry);
+  float cz=cos(rz),sz=sin(rz);
+
+  Mat4 T=identity();
+  T.m[0][0]=cy*cz;
+  T.m[0][1]=-cy*sz;
+  T.m[0][2]=sy;
+  T.m[1][0]=sx*sy*cz+cx*sz;
+  T.m[1][1]=-sx*sy*sz+cx*cz;
+  T.m[1][2]=-sx*cy;
+  T.m[2][0]=-cx*sy*cz+sx*sz;
+  T.m[2][1]=cx*sy*sz+sx*cz;
+  T.m[2][2]=cx*cy;
+  return T;
+}
+
+/* ===================== Euler from Matrix ===================== */
+
+void matrixToEulerXYZ(const Mat4& T, float& rx, float& ry, float& rz) {
+  // Extrahiere Euler XYZ aus Rotationsmatrix
+  float sy = T.m[0][2];
+  
+  if(fabsf(sy) < 0.99999f) {
+    ry = asinf(sy);
+    rx = atan2f(-T.m[1][2], T.m[2][2]);
+    rz = atan2f(-T.m[0][1], T.m[0][0]);
+  } else {
+    // Gimbal lock
+    ry = (sy > 0) ? M_PI/2 : -M_PI/2;
+    rx = atan2f(T.m[2][1], T.m[1][1]);
+    rz = 0;
+  }
+}
+
+/* ===================== Debug ===================== */
+
+void printJointAngle(){  for(int i=0;i<6;i++){ Serial.printf("J%d = %.2f deg\n",i+1,q[i]*RAD2DEG);}} // output joint angle
+
+void printJointFrames() {
+  Mat4 T[7];
+  forwardAll(q, T);
+
+  for (int i = 1; i <= 6; i++) {
+
+    float px = T[i].m[0][3];   
+    float py = T[i].m[1][3];  
+    float pz = T[i].m[2][3];   
+
+    float vx = T[i].m[0][2];
+    float vy = T[i].m[1][2];
+    float vz = T[i].m[2][2];
+
+    Serial.printf(
+      "j%d(%.1f,%.1f,%.1f) vj%d(%.1f,%.1f,%.1f)\n",
+      i, px, py, pz,
+      i, vx, vy, vz
+    );
+  }
+}
+void printDH(){
+  for(int i=0;i<6;i++)
+    Serial.printf("J%d: a=%.3f alpha=%.1f d=%.3f off=%.1f\n",
+      i+1,dh[i].a,dh[i].alpha*RAD2DEG,dh[i].d,dh[i].offset*RAD2DEG);
+}
+
+void printTCP() { // Print Out Tool Center Point
+  Mat4 T[7];
+  forwardAll(q, T);
+  Mat4 Ttcp = mul(T[6], T_tool);
+  
+  float x = Ttcp.m[0][3];
+  float y = Ttcp.m[1][3];
+  float z = Ttcp.m[2][3];
+  
+  float rx, ry, rz;
+  matrixToEulerXYZ(Ttcp, rx, ry, rz);
+  
+  Serial.printf("TCP: %.2f %.2f %.2f %.2f %.2f %.2f\n",
+    x, y, z, rx*RAD2DEG, ry*RAD2DEG, rz*RAD2DEG);
+}
+
+/* ===================== Serial ===================== */
+
+void setup(){
+  Serial.begin(115200);
+  while(!Serial);
+  // Kompensiere 180° Z-Rotation der Home-Pose + Tool-Offset
+  T_tool = eulerXYZ(0, 0, -180);
+  T_tool.m[0][3] = tool_offset.x;
+  T_tool.m[1][3] = tool_offset.y;
+  T_tool.m[2][3] = tool_offset.z;
+  Serial.println("ESP32 IK ready.");
+}
+
+void loop(){
+  if(!Serial.available()) return;
+  String s=Serial.readStringUntil('\n'); s.trim();
+  
+  if(s=="get_angle") printJointAngle();
+  else if (s == "get_pos") { printJointFrames();}
+  else if(s=="get_tcp") printTCP();
+  else if(s=="get_dh") printDH();
+
+  else if(s.startsWith("set_tool")){// x[mm],y[mm],z[mm],rotX[°],rotY[°],rotZ[°]
+    float x,y,z,rx,ry,rz;
+    sscanf(s.c_str(),"set_tool %f %f %f %f %f %f",&x,&y,&z,&rx,&ry,&rz);
+    // Speichere Offset in globaler Variable
+    tool_offset.x = x;
+    tool_offset.y = y;
+    tool_offset.z = z;
+    // Baue T_tool mit Basis-Rotation (-180°Z) + neuer Rotation + Offset
+    T_tool = eulerXYZ(rx, ry, rz - 180); // -180 base offset --> Home = 0°
+    T_tool.m[0][3] = x;
+    T_tool.m[1][3] = y;
+    T_tool.m[2][3] = z;
+    Serial.printf("Tool updated: offset(%.1f,%.1f,%.1f) rot(%.1f,%.1f,%.1f)\n", x,y,z,rx,ry,rz);
+  }
+
+  else if(s.startsWith("set ")){
+    float x,y,z,rx,ry,rz;
+    sscanf(s.c_str(),"set %f %f %f %f %f %f",&x,&y,&z,&rx,&ry,&rz);
+    Mat4 T=eulerXYZ(rx,ry,rz);
+    T.m[0][3]=x; T.m[1][3]=y; T.m[2][3]=z;
+    unsigned long delta_ms = millis();
+    solveIK(q,T);
+    delta_ms = millis() -delta_ms;
+    printJointAngle();
+    Serial.printf("delta_ms(IK) %d\n",(int)delta_ms);
+
+  }
+
+  else if(s.startsWith("set_ik")){
+    sscanf(s.c_str(),"set_ik %d %f",&ik_iters,&ik_lambda);
+    Serial.println("IK params updated.");
+  }
+}

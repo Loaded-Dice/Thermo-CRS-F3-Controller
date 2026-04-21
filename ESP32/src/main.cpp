@@ -60,6 +60,12 @@ DIAG/CAL
 09	89	0A	00	0A	00	80		09	89	00	00	00	00	80	
 09	88	0A	00	0A	00	81		09	88	00	00	00	00	81	
 
+
+use: 
+bool writeExtraFrame(const uint8_t frame[FRAME_BYTES])
+and
+bool readExtraResponse()
+
 To do  : add pinout overview
 
 use 2nd direct wire between esp & fpga
@@ -152,13 +158,6 @@ static void position_to_3bytes(int32_t position, uint8_t& byte1, uint8_t& byte2,
 
 // Calculate CRC for a 7-byte frame
 static uint8_t calculate_frame_crc(const uint8_t frame[7]) { return frame[0] ^ frame[1] ^ frame[2] ^ frame[3] ^ frame[4] ^ frame[5]; }
-inline void setBit(uint8_t &reg, uint8_t bitPos, bool value) {
-    if (value) {
-        reg |= (1 << bitPos);
-    } else {
-        reg &= ~(1 << bitPos);
-    }
-}
 
 
 static void spiReadBlock(uint8_t command, uint8_t* buffer, size_t length) {

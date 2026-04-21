@@ -1,0 +1,287 @@
+// ================================================================
+//  Stepper Trajectory Generator — ESP32 (Arduino Framework)
+//
+//  Generates a trapezoidal / triangular position profile and sends
+//  a new setpoint to the robot controller every 10 ms.
+//
+//  Architecture:
+//    - Hardware timer ISR fires every 10 ms and only sets a flag
+//      + copies the next setpoint value. No protocol code in ISR.
+//    - Main loop detects the flag and calls the user-supplied
+//      send function in a safe, non-ISR context.
+//    - Trajectory array is pre-computed before motion starts,
+//      so the ISR only does an array read + integer increment.
+// ================================================================
+
+#include <Arduino.h>
+#include <cmath>
+#include <vector>
+#include <functional>
+
+// ----------------------------------------------------------------
+//  Timing
+// ----------------------------------------------------------------
+constexpr float    TICK_MS        = 10.0f;
+constexpr float    TICK_S         = TICK_MS / 1000.0f;
+constexpr uint32_t TICK_US        = 10000UL;   // 10 ms in µs
+
+// Timer prescaler: 80 MHz / 80 = 1 MHz → 1 tick = 1 µs
+constexpr uint16_t TIMER_PRESCALER = 80;
+
+// ----------------------------------------------------------------
+//  Trajectory configuration
+// ----------------------------------------------------------------
+struct TrajConfig {
+    long  startPos;   // absolute start position (steps)
+    long  targetPos;  // absolute target position (steps)
+    float accel;      // acceleration / deceleration (steps/s²)
+    float vmax;       // maximum velocity (steps/s)
+};
+
+// ----------------------------------------------------------------
+//  ISR ↔ Loop communication
+//  All fields written by ISR must be declared volatile.
+//  Larger types (long) are read/written atomically on Xtensa LX6,
+//  but we still guard them with a spinlock to be safe.
+// ----------------------------------------------------------------
+static volatile bool g_isrFlag       = false;   // set by ISR, cleared by loop
+static volatile long g_isrSetpoint   = 0;       // setpoint to transmit
+static volatile bool g_running       = false;   // motion in progress
+static volatile int  g_tickIndex     = 0;       // current position in traj array
+
+// Pre-computed trajectory — written once before motion starts,
+// then only read by the ISR (no race condition after g_running = true)
+static std::vector<long> g_traj;
+
+static hw_timer_t*  g_timer = nullptr;
+static portMUX_TYPE g_mux   = portMUX_INITIALIZER_UNLOCKED;
+
+// User-supplied send function — called from loop(), never from ISR
+using SendFunc = std::function<void(long setpoint)>;
+static SendFunc g_sendFunc;
+
+// ----------------------------------------------------------------
+//  Pre-compute trajectory array
+//
+//  Evaluates pos(t) for every 10 ms tick and stores integer-rounded
+//  step positions. One entry per tick, last entry is always exactly
+//  targetPos.
+//
+//  Physics:
+//    Accel phase:  pos(t) = 0.5 * a * t²
+//    Const phase:  pos(t) = sAcc + vPeak * (t - tAcc)
+//    Decel phase:  pos(t) = sAcc + sConst + vPeak*dt - 0.5*a*dt²
+// ----------------------------------------------------------------
+static std::vector<long> buildTrajectory(const TrajConfig& cfg)
+{
+    float dist = std::abs((float)(cfg.targetPos - cfg.startPos));
+    int   dir  = (cfg.targetPos >= cfg.startPos) ? 1 : -1;
+
+    // Distance required to accelerate from 0 to vmax: s = v² / (2a)
+    float sToVmax = (cfg.vmax * cfg.vmax) / (2.0f * cfg.accel);
+
+    float vPeak, sAcc, sConst, tAcc, tConst, tTotal;
+
+    if (2.0f * sToVmax >= dist) {
+        // Triangle profile: vmax is never reached
+        vPeak  = std::sqrt(cfg.accel * dist);
+        sAcc   = dist / 2.0f;
+        sConst = 0.0f;
+    } else {
+        // Trapezoid profile
+        vPeak  = cfg.vmax;
+        sAcc   = sToVmax;
+        sConst = dist - 2.0f * sToVmax;
+    }
+
+    tAcc   = vPeak / cfg.accel;
+    tConst = (sConst > 0.0f) ? sConst / vPeak : 0.0f;
+    tTotal = tAcc + tConst + (vPeak / cfg.accel);   // tAcc + tConst + tDec
+
+    // Number of ticks: ceil so we always cover the full distance
+    int numTicks = (int)std::ceil(tTotal / TICK_S) + 1;
+
+    std::vector<long> traj;
+    traj.reserve(numTicks + 4);
+
+    for (int i = 0; i < numTicks; ++i) {
+        float t = (float)i * TICK_S;
+        float relPos;
+
+        if (t <= tAcc) {
+            // Acceleration phase
+            relPos = 0.5f * cfg.accel * t * t;
+        }
+        else if (t <= tAcc + tConst) {
+            // Constant velocity phase
+            float dt = t - tAcc;
+            relPos   = sAcc + vPeak * dt;
+        }
+        else {
+            // Deceleration phase
+            float dt = t - tAcc - tConst;
+            relPos   = sAcc + sConst + vPeak * dt - 0.5f * cfg.accel * dt * dt;
+            // Clamp to avoid floating-point overshoot
+            if (relPos > dist) relPos = dist;
+        }
+
+        // Round to nearest integer step — same as the original controller
+        long absPos = cfg.startPos + (long)std::round((float)dir * relPos);
+        traj.push_back(absPos);
+    }
+
+    // Final entry: guarantee exact target position
+    traj.push_back(cfg.targetPos);
+
+    return traj;
+}
+
+// ----------------------------------------------------------------
+//  Hardware timer ISR — runs every 10 ms
+//
+//  Rules:
+//    - Must be in IRAM (no flash access during ISR)
+//    - Only array read + flag set — no protocol, no Serial, no malloc
+//    - Spinlock guards shared variables
+// ----------------------------------------------------------------
+void IRAM_ATTR onTick()
+{
+    portENTER_CRITICAL_ISR(&g_mux);
+
+    if (!g_running) {
+        portEXIT_CRITICAL_ISR(&g_mux);
+        return;
+    }
+
+    if (g_tickIndex < (int)g_traj.size()) {
+        // Copy next setpoint for the loop to transmit
+        g_isrSetpoint = g_traj[g_tickIndex];
+        g_tickIndex++;
+        g_isrFlag = true;   // signal to loop: new setpoint ready
+    } else {
+        // All ticks exhausted — stop timer
+        g_running = false;
+        timerAlarmDisable(g_timer);
+    }
+
+    portEXIT_CRITICAL_ISR(&g_mux);
+}
+
+// ----------------------------------------------------------------
+//  Public API
+// ----------------------------------------------------------------
+
+// Call once in setup().
+// sendFunc  — your protocol send function, e.g. RS485 write.
+//             Called from loop(), never from ISR.
+void trajectoryInit(SendFunc sendFunc)
+{
+    g_sendFunc = sendFunc;
+
+    // Timer 0, prescaler 80 → 1 µs resolution, count up
+    g_timer = timerBegin(0, TIMER_PRESCALER, true);
+    timerAttachInterrupt(g_timer, &onTick, true);
+
+    // Set alarm period to 10 ms, auto-reload
+    timerAlarmWrite(g_timer, TICK_US, true);
+
+    // Do not enable alarm yet — trajectoryStart() does that
+}
+
+// Start a new move. Returns immediately; motion runs in background.
+// Safe to call again after trajectoryRunning() returns false.
+void trajectoryStart(long startPos, long targetPos,
+                     float accel = 1100.0f,
+                     float vmax  = 2300.0f)
+{
+    if (g_running) return;   // reject if already moving
+
+    // Build trajectory array before arming the timer
+    TrajConfig cfg { startPos, targetPos, accel, vmax };
+    g_traj = buildTrajectory(cfg);
+
+    // Reset ISR state — no spinlock needed here since timer is disarmed
+    g_tickIndex    = 0;
+    g_isrFlag      = false;
+    g_isrSetpoint  = startPos;
+
+    // Arm: set g_running before enabling alarm so ISR never sees
+    // g_running=false after the first tick
+    portENTER_CRITICAL(&g_mux);
+    g_running = true;
+    portEXIT_CRITICAL(&g_mux);
+
+    timerAlarmEnable(g_timer);
+}
+
+// Returns true while a move is in progress
+bool trajectoryRunning()
+{
+    return g_running;
+}
+
+// Block until current move finishes (feeds WDT via yield)
+void trajectoryWait()
+{
+    while (g_running) yield();
+}
+
+// ----------------------------------------------------------------
+//  Loop handler — call every iteration of loop()
+//
+//  Checks the ISR flag and, if set, calls the send function with
+//  the latest setpoint. Must be called frequently enough that the
+//  loop body completes well within 10 ms.
+// ----------------------------------------------------------------
+void trajectoryUpdate()
+{
+    // Fast path: nothing to do
+    if (!g_isrFlag) return;
+
+    // Read setpoint and clear flag — spinlock keeps it consistent
+    long setpoint;
+    portENTER_CRITICAL(&g_mux);
+    setpoint  = g_isrSetpoint;
+    g_isrFlag = false;
+    portEXIT_CRITICAL(&g_mux);
+
+    // Transmit via user protocol — safe non-ISR context
+    if (g_sendFunc) g_sendFunc(setpoint);
+}
+
+// ================================================================
+//  Application code — replace sendSetpoint() with your protocol
+// ================================================================
+
+void sendSetpoint(long pos)
+{
+    // TODO: replace with your reverse-engineered protocol
+    // e.g. RS485 frame, SPI packet, CAN message, ...
+    Serial.printf("setpoint: %ld\n", pos);
+}
+
+void setup()
+{
+    Serial.begin(115200);
+
+    trajectoryInit(sendSetpoint);
+
+    Serial.println("Starting move 2945 -> 5789");
+    trajectoryStart(2945, 5789);
+}
+
+void loop()
+{
+    // Must be called every loop iteration — handles ISR flag
+    trajectoryUpdate();
+
+    // Example: start return move once done
+    if (!trajectoryRunning()) {
+        Serial.println("Move complete.");
+        delay(1000);
+        trajectoryStart(5789, 2945);
+        trajectoryWait();
+        delay(1000);
+        trajectoryStart(2945, 5789);
+    }
+}
