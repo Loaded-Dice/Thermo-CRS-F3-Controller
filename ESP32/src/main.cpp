@@ -312,29 +312,11 @@ static void printStatusLine(const ControllerStatus& status) {
 }
 
 static void printFrameSummary(uint8_t nodeIndex, const uint8_t frame[FRAME_BYTES], bool valid) {
-    //printHexByte(NODE_IDS[nodeIndex]);
+
     if (!valid) { Serial.printf(" 0x%02X pos=------ status=-- -- crc=--\n",NODE_IDS[nodeIndex]); return; } 
     const int32_t signedPosition = reinterpret_24bit_signed(static_cast<uint32_t>(frame[1]) | (static_cast<uint32_t>(frame[2]) << 8) | (static_cast<uint32_t>(frame[3]) << 16));
-    
     Serial.printf(" 0x%02X  pos= %+d raw=0x%02X%02X%02X  status=0x%02X %02X crc=0x%02X \n",NODE_IDS[nodeIndex], signedPosition, frame[1],frame[2],frame[3],frame[4],frame[5],frame[6]);
-    // const uint32_t rawPositionLE = static_cast<uint32_t>(frame[1]) | (static_cast<uint32_t>(frame[2]) << 8) | (static_cast<uint32_t>(frame[3]) << 16);
-    // Serial.printf(" 0x%02X  pos= %+d raw=0x%06X  status=0x%02X %02X crc=0x%02X \n",NODE_IDS[nodeIndex], signedPosition, rawPositionLE,frame[4],frame[5],frame[6]);
-    //Serial.println(" pos=------ status=-- -- crc=--");
-    // const uint32_t rawPositionLE = static_cast<uint32_t>(frame[1]) | (static_cast<uint32_t>(frame[2]) << 8) | (static_cast<uint32_t>(frame[3]) << 16);
-    // Serial.print(" pos=");
-    // Serial.print(signedPosition);
-    // Serial.print(" raw=0x");
-    // if (rawPositionLE < 0x10) Serial.print("00000");
-    // else if (rawPositionLE < 0x100) Serial.print("0000");
-    // else if (rawPositionLE < 0x1000) Serial.print("000");
-    // else if (rawPositionLE < 0x10000) Serial.print("00");
-    // else if (rawPositionLE < 0x100000) Serial.print('0');
-    
-    // Serial.print(rawPositionLE, HEX);
-    // Serial.print(" status="); printHexByte(frame[4]);
-    // Serial.print(' '); printHexByte(frame[5]);
-    // Serial.print(" crc="); printHexByte(frame[6]);
-    // Serial.println();
+
 }
 
 static void printSnapshot(const ControllerStatus& status, uint8_t frames[NODE_COUNT][FRAME_BYTES]) {
@@ -346,9 +328,7 @@ static void printSnapshot(const ControllerStatus& status, uint8_t frames[NODE_CO
     Serial.println();
 }
 
-static bool controllerRunning(const ControllerStatus& status) {
-    return (status.flags & 0x01u) != 0;
-}
+static bool controllerRunning(const ControllerStatus& status) { return (status.flags & 0x01u) != 0; }
 
 void setup() {
     Serial.begin(UART_BAUD);
@@ -360,11 +340,8 @@ void setup() {
     SPI.begin(PIN_SPI_SCLK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SPI_CS);
 
     Serial.println("FPGA controller poller ready");
-    if (startInitSequence()) {
-        Serial.println("Init sequence started");
-    } else {
-        Serial.println("Init sequence start rejected");
-    }
+    if (startInitSequence()) { Serial.println("Init sequence started"); } 
+    else { Serial.println("Init sequence start rejected");    }
 
     // Example usage of authority & position control (commented out):
     // delay(5000);  // Wait for init to complete
