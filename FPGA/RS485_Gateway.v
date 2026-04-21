@@ -1,4 +1,4 @@
-module rs485_sniffer (
+module rs485_Gateway (
     input  wire clk_12m,
     input  wire rs485_rx_slave,
     output reg  rs485_tx_master,
@@ -7,7 +7,8 @@ module rs485_sniffer (
     input  wire spi_sck,
     input  wire spi_mosi,
     input  wire spi_cs_n,
-    output wire spi_miso
+    output wire spi_miso,
+    output reg  frame_block_done
 );
 
     (* keep = "true" *) wire clk;
@@ -62,6 +63,12 @@ module rs485_sniffer (
     localparam [7:0] SPI_CMD_READ_FRAMES = 8'hB1;
     localparam [7:0] SPI_CMD_START_INIT  = 8'hB2;
     localparam [7:0] SPI_CMD_RESET_CTRL  = 8'hB3;
+    localparam [7:0] SPI_CMD_GET_AUTH_STATE = 8'hB4;
+    localparam [7:0] SPI_CMD_TAKE_AUTHORITY = 8'hB5;
+    localparam [7:0] SPI_CMD_RETURN_AUTHORITY = 8'hB6;
+    localparam [7:0] SPI_CMD_WRITE_POSITION = 8'hB7;
+    localparam [7:0] SPI_CMD_WRITE_EXTRA = 8'hB8;
+    localparam [7:0] SPI_CMD_READ_EXTRA = 8'hB9;
 
     function [7:0] node_id;
         input [2:0] index;
@@ -72,7 +79,9 @@ module rs485_sniffer (
                 3'd2: node_id = 8'h11;
                 3'd3: node_id = 8'h09;
                 3'd4: node_id = 8'h12;
-                default: node_id = 8'h0A;
+                3'd5: node_id = 8'h0A;
+                3'd6: node_id = 8'h20;  // Extra frame (Gripper/Reset)
+                default: node_id = 8'h20;
             endcase
         end
     endfunction
@@ -120,6 +129,14 @@ module rs485_sniffer (
     reg [7:0] response_slots [0:41];
     reg [7:0] shadow_positions [0:17];
 
+    // ESP2FPGA Input Buffers for position writes (7 nodes: 0x10..0x0A + 0x20)
+    reg [7:0] esp2fpga_buffer [0:48];  // 7 nodes * 7 bytes = 49 bytes
+    reg [6:0] buffer_writeable = 7'b1111111;  // Bit per node: 1=writeable, 0=blocked
+    reg esp_has_authority = 1'b0;  // 0=Robot has authority, 1=ESP has authority
+    reg extra_frame_pending = 1'b0;  // Extra frame (0x20) ready to send
+    reg [7:0] extra_response [0:6];  // Extra frame response (7 bytes)
+    reg extra_response_valid = 1'b0;  // Extra response has been received
+
     reg [2:0] controller_phase = PHASE_IDLE;
     reg [1:0] controller_state = CTRL_IDLE;
     reg [2:0] current_node = 3'd0;
@@ -141,6 +158,10 @@ module rs485_sniffer (
     reg [7:0] spi_tx_next;
     reg spi_start_init_flag;
     reg spi_reset_flag;
+    reg spi_take_authority_flag;
+    reg spi_return_authority_flag;
+    reg [2:0] spi_write_node_idx;  // Which node to write (0-6)
+    reg spi_write_trigger;
 
     // Cross-domain synchronizers (60 MHz domain)
     reg [1:0] sync_start_init = 2'b00;
@@ -148,14 +169,21 @@ module rs485_sniffer (
     reg [1:0] sync_reset_ctrl = 2'b00;
     reg        sync_reset_prev = 1'b0;
     reg [1:0] sync_cs_n = 2'b11;
+    reg [1:0] sync_take_authority = 2'b00;
+    reg        sync_take_auth_prev = 1'b0;
+    reg [1:0] sync_return_authority = 2'b00;
+    reg        sync_return_auth_prev = 1'b0;
 
     wire start_init_pulse = sync_start_init[1] && !sync_start_prev;
     wire controller_reset_pulse = sync_reset_ctrl[1] && !sync_reset_prev;
     wire cs_fall_60m = (sync_cs_n == 2'b10);
+    wire take_authority_pulse = sync_take_authority[1] && !sync_take_auth_prev;
+    wire return_authority_pulse = sync_return_authority[1] && !sync_return_auth_prev;
 
     // Snapshot registers (latched in 60 MHz domain on CS falling edge)
     reg [7:0] snap_status [0:7];
     reg [7:0] snap_frames [0:41];
+    reg [7:0] snap_extra [0:6];
     reg snap_init_ack = 1'b0;
 
     assign spi_miso = (!spi_cs_n && spi_bit_phase >= 4'd1 && spi_bit_phase <= 4'd8) ?
@@ -260,11 +288,18 @@ module rs485_sniffer (
 
     initial begin
         rs485_tx_master = 1'b1;
+        frame_block_done = 1'b0;
         for (init_index = 0; init_index < 42; init_index = init_index + 1) begin
             response_slots[init_index] = 8'h00;
         end
         for (init_index = 0; init_index < 18; init_index = init_index + 1) begin
             shadow_positions[init_index] = 8'h00;
+        end
+        for (init_index = 0; init_index < 49; init_index = init_index + 1) begin
+            esp2fpga_buffer[init_index] = 8'h00;
+        end
+        for (init_index = 0; init_index < 7; init_index = init_index + 1) begin
+            extra_response[init_index] = 8'h00;
         end
     end
 
@@ -485,6 +520,18 @@ module rs485_sniffer (
                             response_frame_b5 <= response_build_b5;
                             response_frame_b6 <= rx_byte;
                             response_frame_valid <= 1'b1;
+                            
+                            // If this is an extra frame response (NodeID 0x20), store it
+                            if (response_build_b0 == 8'h20) begin
+                                extra_response[0] <= response_build_b0;
+                                extra_response[1] <= response_build_b1;
+                                extra_response[2] <= response_build_b2;
+                                extra_response[3] <= response_build_b3;
+                                extra_response[4] <= response_build_b4;
+                                extra_response[5] <= response_build_b5;
+                                extra_response[6] <= rx_byte;
+                                extra_response_valid <= 1'b1;
+                            end
                         end else begin
                             response_frame_crc_error <= 1'b1;
                         end
@@ -740,16 +787,38 @@ module rs485_sniffer (
 
                     CTRL_WAIT_GAP: begin
                         if (cycle_counter >= gap_target) begin
-                            request_b0 <= req_template_b0;
-                            request_b1 <= req_template_b1;
-                            request_b2 <= req_template_b2;
-                            request_b3 <= req_template_b3;
-                            request_b4 <= req_template_b4;
-                            request_b5 <= req_template_b5;
-                            request_b6 <= req_template_b6;
+                            // Copy from ESP2FPGA buffer if ESP has authority, otherwise use template
+                            if (esp_has_authority && (controller_phase == PHASE_LOOP_E) && (current_node < 3'd6)) begin
+                                // ESP has authority: copy from ESP2FPGA buffer for this node
+                                request_b0 <= esp2fpga_buffer[current_node * 7 + 0];
+                                request_b1 <= esp2fpga_buffer[current_node * 7 + 1];
+                                request_b2 <= esp2fpga_buffer[current_node * 7 + 2];
+                                request_b3 <= esp2fpga_buffer[current_node * 7 + 3];
+                                request_b4 <= esp2fpga_buffer[current_node * 7 + 4];
+                                request_b5 <= esp2fpga_buffer[current_node * 7 + 5];
+                                request_b6 <= esp2fpga_buffer[current_node * 7 + 6];
+                                // Mark buffer as writeable immediately after copy
+                                buffer_writeable[current_node] <= 1'b1;
+                            end else begin
+                                // Robot has authority OR init phase: use template
+                                request_b0 <= req_template_b0;
+                                request_b1 <= req_template_b1;
+                                request_b2 <= req_template_b2;
+                                request_b3 <= req_template_b3;
+                                request_b4 <= req_template_b4;
+                                request_b5 <= req_template_b5;
+                                request_b6 <= req_template_b6;
+                            end
                             tx_frame_pending <= 1'b1;
                             cycle_counter <= 20'd0;
                             controller_state <= CTRL_WAIT_TX;
+                            
+                            // Pulse frame_block_done when returning to node 0
+                            if (current_node == 3'd5) begin
+                                frame_block_done <= 1'b1;
+                            end
+                        end else begin
+                            frame_block_done <= 1'b0;
                         end
                     end
 
@@ -766,6 +835,26 @@ module rs485_sniffer (
         sync_reset_ctrl <= {sync_reset_ctrl[0], spi_reset_flag};
         sync_reset_prev <= sync_reset_ctrl[1];
         sync_cs_n <= {sync_cs_n[0], spi_cs_n};
+        sync_take_authority <= {sync_take_authority[0], spi_take_authority_flag};
+        sync_take_auth_prev <= sync_take_authority[1];
+        sync_return_authority <= {sync_return_authority[0], spi_return_authority_flag};
+        sync_return_auth_prev <= sync_return_authority[1];
+    end
+
+    // ---- Authority control ----
+    always @(posedge clk) begin
+        if (controller_reset_pulse) begin
+            esp_has_authority <= 1'b0;
+            buffer_writeable <= 7'b1111111;
+        end else begin
+            if (take_authority_pulse) begin
+                esp_has_authority <= 1'b1;
+                buffer_writeable <= 7'b1111111;  // All buffers writeable when taking authority
+            end
+            if (return_authority_pulse) begin
+                esp_has_authority <= 1'b0;
+            end
+        end
     end
 
     // ---- Snapshot latch: capture status + frames on CS falling edge (60 MHz) ----
@@ -783,6 +872,9 @@ module rs485_sniffer (
             for (init_index = 0; init_index < 42; init_index = init_index + 1) begin
                 snap_frames[init_index] <= response_slots[init_index];
             end
+            for (init_index = 0; init_index < 7; init_index = init_index + 1) begin
+                snap_extra[init_index] <= extra_response[init_index];
+            end
             snap_init_ack <= (controller_state == CTRL_IDLE && !run_active) ? 1'b1 : 1'b0;
         end
     end
@@ -798,6 +890,10 @@ module rs485_sniffer (
             spi_tx_next <= 8'd0;
             spi_start_init_flag <= 1'b0;
             spi_reset_flag <= 1'b0;
+            spi_take_authority_flag <= 1'b0;
+            spi_return_authority_flag <= 1'b0;
+            spi_write_node_idx <= 3'd0;
+            spi_write_trigger <= 1'b0;
         end else begin
             spi_shift_in <= {spi_shift_in[6:0], spi_mosi};
 
@@ -833,6 +929,36 @@ module rs485_sniffer (
                             spi_tx_next <= 8'hA5;
                         end
 
+                        SPI_CMD_GET_AUTH_STATE: begin
+                            // Return: bit7=authority, bit6-0=writeable flags
+                            spi_tx_next <= {esp_has_authority, buffer_writeable};
+                        end
+
+                        SPI_CMD_TAKE_AUTHORITY: begin
+                            spi_take_authority_flag <= 1'b1;
+                            spi_tx_next <= 8'hA5;
+                        end
+
+                        SPI_CMD_RETURN_AUTHORITY: begin
+                            spi_return_authority_flag <= 1'b1;
+                            spi_tx_next <= 8'hA5;
+                        end
+
+                        SPI_CMD_WRITE_POSITION: begin
+                            // Next byte will be node index (0-5)
+                            spi_tx_next <= 8'hA5;
+                        end
+
+                        SPI_CMD_WRITE_EXTRA: begin
+                            // Write extra frame (node 6 = 0x20)
+                            spi_write_node_idx <= 3'd6;
+                            spi_tx_next <= 8'hA5;
+                        end
+
+                        SPI_CMD_READ_EXTRA: begin
+                            spi_tx_next <= snap_extra[0];
+                        end
+
                         default: begin
                             spi_tx_next <= 8'hEE;
                         end
@@ -851,6 +977,49 @@ module rs485_sniffer (
                                 spi_tx_next <= snap_frames[spi_byte_idx];
                             else
                                 spi_tx_next <= 8'h00;
+                        end
+
+                        SPI_CMD_READ_EXTRA: begin
+                            if (spi_byte_idx < 6'd7)
+                                spi_tx_next <= snap_extra[spi_byte_idx];
+                            else
+                                spi_tx_next <= 8'h00;
+                        end
+
+                        SPI_CMD_WRITE_POSITION: begin
+                            if (spi_byte_idx == 6'd1) begin
+                                // Byte 1: node index (0-5) - take lower 3 bits
+                                spi_write_node_idx <= {spi_shift_in[1:0], spi_mosi};
+                                spi_tx_next <= 8'h00;
+                            end else if (spi_byte_idx >= 6'd2 && spi_byte_idx <= 6'd8) begin
+                                // Bytes 2-8: frame data (7 bytes)
+                                if (buffer_writeable[spi_write_node_idx]) begin
+                                    esp2fpga_buffer[spi_write_node_idx * 7 + (spi_byte_idx - 6'd2)] <= {spi_shift_in[6:0], spi_mosi};
+                                end
+                                spi_tx_next <= 8'h00;
+                                // Mark buffer as not writeable after last byte
+                                if (spi_byte_idx == 6'd8) begin
+                                    buffer_writeable[spi_write_node_idx] <= 1'b0;
+                                end
+                            end else begin
+                                spi_tx_next <= 8'h00;
+                            end
+                        end
+
+                        SPI_CMD_WRITE_EXTRA: begin
+                            if (spi_byte_idx >= 6'd1 && spi_byte_idx <= 6'd7) begin
+                                // Bytes 1-7: frame data (7 bytes)
+                                if (buffer_writeable[6]) begin
+                                    esp2fpga_buffer[6 * 7 + (spi_byte_idx - 6'd1)] <= {spi_shift_in[6:0], spi_mosi};
+                                end
+                                spi_tx_next <= 8'h00;
+                                // Mark buffer as not writeable after last byte
+                                if (spi_byte_idx == 6'd7) begin
+                                    buffer_writeable[6] <= 1'b0;
+                                end
+                            end else begin
+                                spi_tx_next <= 8'h00;
+                            end
                         end
 
                         default: begin

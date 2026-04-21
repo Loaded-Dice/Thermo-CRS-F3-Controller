@@ -7,3 +7,4 @@ set_io spi_sck G1
 set_io spi_mosi H1
 set_io spi_cs_n J1
 set_io spi_miso L1
+set_io frame_block_done J3 # GPIO14 (ESP32) frame block done signal

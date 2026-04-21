@@ -1,9 +1,9 @@
 SHELL := cmd
 .SHELLFLAGS := /C
 
-TOP ?= rs485_sniffer
-SRC ?= rs485_sniffer.v
-PCF ?= rs485_sniffer.pcf
+TOP ?= rs485_Gateway
+SRC ?= rs485_Gateway.v
+PCF ?= rs485_Gateway.pcf
 DEVICE ?= hx8k
 PACKAGE ?= cb132
 BUILD_DIR ?= build
