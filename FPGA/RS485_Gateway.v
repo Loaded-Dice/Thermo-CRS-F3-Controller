@@ -150,18 +150,18 @@ module rs485_Gateway (
     reg init_done = 1'b0;
 
     // SPI-domain registers (clocked on spi_sck)
-    reg [7:0] spi_shift_in;
-    reg [3:0] spi_bit_phase;
-    reg [5:0] spi_byte_idx;
-    reg [7:0] spi_cmd;
-    reg [7:0] spi_tx_curr;
-    reg [7:0] spi_tx_next;
-    reg spi_start_init_flag;
-    reg spi_reset_flag;
-    reg spi_take_authority_flag;
-    reg spi_return_authority_flag;
-    reg [2:0] spi_write_node_idx;  // Which node to write (0-6)
-    reg spi_write_trigger;
+    reg [7:0] spi_shift_in = 8'd0;
+    reg [3:0] spi_bit_phase = 4'd0;
+    reg [5:0] spi_byte_idx = 6'd0;
+    reg [7:0] spi_cmd = 8'd0;
+    reg [7:0] spi_tx_curr = 8'd0;
+    reg [7:0] spi_tx_next = 8'd0;
+    reg spi_start_init_flag = 1'b0;
+    reg spi_reset_flag = 1'b0;
+    reg spi_take_authority_flag = 1'b0;
+    reg spi_return_authority_flag = 1'b0;
+    reg [2:0] spi_write_node_idx = 3'd0;  // Which node to write (0-6)
+    reg spi_write_trigger = 1'b0;
 
     // Cross-domain synchronizers (60 MHz domain)
     reg [1:0] sync_start_init = 2'b00;
@@ -859,7 +859,6 @@ module rs485_Gateway (
 
     // ---- Snapshot latch: capture status + frames on CS falling edge (60 MHz) ----
     always @(posedge clk) begin
-        snap_init_ack <= 1'b0;
         if (cs_fall_60m) begin
             snap_status[0] <= status_byte(4'd0);
             snap_status[1] <= status_byte(4'd1);
@@ -888,14 +887,24 @@ module rs485_Gateway (
             spi_cmd <= 8'd0;
             spi_tx_curr <= 8'd0;
             spi_tx_next <= 8'd0;
-            spi_start_init_flag <= 1'b0;
-            spi_reset_flag <= 1'b0;
-            spi_take_authority_flag <= 1'b0;
-            spi_return_authority_flag <= 1'b0;
+            // Flags are NOT cleared here - they latch until controller domain acknowledges them
+            // spi_start_init_flag <= 1'b0;
+            // spi_reset_flag <= 1'b0;
+            // spi_take_authority_flag <= 1'b0;
+            // spi_return_authority_flag <= 1'b0;
             spi_write_node_idx <= 3'd0;
             spi_write_trigger <= 1'b0;
         end else begin
             spi_shift_in <= {spi_shift_in[6:0], spi_mosi};
+
+            // Clear all command flags at very start of transaction (before first bit)
+            // This prevents race condition where old flags trigger actions before new command is received
+            if (spi_bit_phase == 4'd0) begin
+                spi_start_init_flag <= 1'b0;
+                spi_reset_flag <= 1'b0;
+                spi_take_authority_flag <= 1'b0;
+                spi_return_authority_flag <= 1'b0;
+            end
 
             if (spi_bit_phase == 4'd8) begin
                 spi_bit_phase <= 4'd1;

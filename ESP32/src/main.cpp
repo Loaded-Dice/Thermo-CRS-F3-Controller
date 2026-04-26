@@ -74,35 +74,20 @@ use 2nd direct wire between esp & fpga
 
 */
 
-
-
 #include <Arduino.h>
 #include <SPI.h>
+#include "fpga_spi.h"
 
-static constexpr int PIN_SPI_CS   = 10;
-static constexpr int PIN_SPI_SCLK = 12;
-static constexpr int PIN_SPI_MOSI = 11;
-static constexpr int PIN_SPI_MISO = 13;
+// Power control pins
+static constexpr int PIN_EN_12V_ODROID = 42;
+static constexpr int PIN_EN_77V = 41; //VMOTOR
+static constexpr int PIN_EN_12V_24V = 40; //VSYS
+static constexpr int PIN_EN_BREAK_PWR = 39; // VBREAKS
+
 static constexpr int PIN_FRAME_BLOCK_DONE = 14;  // IRQ from FPGA when frame block completes
 
-static constexpr uint8_t CMD_READ_STATUS = 0xB0;
-static constexpr uint8_t CMD_READ_FRAMES = 0xB1;
-static constexpr uint8_t CMD_START_INIT  = 0xB2;
-static constexpr uint8_t CMD_GET_AUTH_STATE = 0xB4;
-static constexpr uint8_t CMD_TAKE_AUTHORITY = 0xB5;
-static constexpr uint8_t CMD_RETURN_AUTHORITY = 0xB6;
-static constexpr uint8_t CMD_WRITE_POSITION = 0xB7;
-static constexpr uint8_t CMD_WRITE_EXTRA = 0xB8;
-static constexpr uint8_t CMD_READ_EXTRA = 0xB9;
-
-static constexpr uint8_t NODE_COUNT = 6;
-static constexpr uint8_t FRAME_BYTES = 7;
-static constexpr uint8_t STATUS_BYTES = 8;
-
-static constexpr uint8_t NODE_IDS[NODE_COUNT] = {0x10, 0x08, 0x11, 0x09, 0x12, 0x0A};
-
+// Timing constants
 static constexpr uint32_t UART_BAUD = 256000;
-static constexpr uint32_t SPI_HZ = 4000000;
 static constexpr uint32_t POLL_INTERVAL_US = 1000;
 static constexpr uint32_t FORCE_PRINT_MS = 1000;
 
@@ -120,230 +105,302 @@ static constexpr uint32_t FORCE_PRINT_MS = 1000;
 #define FLAG_BREAK_ENGAGE      (FLAG_BASELINE | MASK_BREAK)      // Breaks are engaged = relay pwr off(breaks are normally closed)
 #define FLAG_BREAK_DISENGAGE   FLAG_BASELINE                     // Controls switching of the relay Output - Breaks 24V must be already supplied
 
-
+bool vSys = false;
 //byte flags = FLAG_DRIVER_ON | FLAG_BREAK_ENGAGE;
 
-struct ControllerStatus {
-    uint8_t flags;
-    uint8_t phase;
-    uint8_t validMask;
-    uint8_t currentNodeId;
-    uint16_t timeoutCount;
-    uint16_t crcErrorCount;
-};
 
-static uint8_t latestFrames[NODE_COUNT][FRAME_BYTES]{};
-static uint8_t previousFrames[NODE_COUNT][FRAME_BYTES]{};
-static ControllerStatus latestStatus{};
-static ControllerStatus previousStatus{};
-static bool previousSnapshotValid = false;
+/*
+- 77V Relay off
+- 24V Breaks Relay off
+- 24V 12V vSys Relay on
+- wait until state=LOOP_E
 
-SPISettings spiSettings(SPI_HZ, MSBFIRST, SPI_MODE0);
-
-static inline void spiBeginTx() { SPI.beginTransaction(spiSettings); digitalWrite(PIN_SPI_CS, LOW); }
-
-static inline void spiEndTx() { digitalWrite(PIN_SPI_CS, HIGH); SPI.endTransaction(); }
-
-static void printHexByte(uint8_t value) { if (value < 0x10) { Serial.print('0'); } Serial.print(value, HEX); }
-
-inline int32_t reinterpret_24bit_signed(uint32_t value) {  return (int32_t)((value << 8) | (value & 0x800000u ? 0xFF000000u : 0u)) >> 8; }
-
-// Convert int32_t position to 3-byte little-endian representation
-static void position_to_3bytes(int32_t position, uint8_t& byte1, uint8_t& byte2, uint8_t& byte3) {
-    uint32_t unsigned_val = static_cast<uint32_t>(position) & 0x00FFFFFFu;
-    byte1 = static_cast<uint8_t>(unsigned_val & 0xFFu);
-    byte2 = static_cast<uint8_t>((unsigned_val >> 8) & 0xFFu);
-    byte3 = static_cast<uint8_t>((unsigned_val >> 16) & 0xFFu);
-}
-
-// Calculate CRC for a 7-byte frame
-static uint8_t calculate_frame_crc(const uint8_t frame[7]) { return frame[0] ^ frame[1] ^ frame[2] ^ frame[3] ^ frame[4] ^ frame[5]; }
+byte flags = 0x26 ; //== ( FLAG_DRIVER_OFF | FLAG_BREAK_ENGAGE );  --> Start condition
 
 
-static void spiReadBlock(uint8_t command, uint8_t* buffer, size_t length) {
-    spiBeginTx();
-    SPI.transfer(command);
-    for (size_t index = 0; index < length; ++index) { buffer[index] = SPI.transfer(0x00); }
-    spiEndTx();
-}
+flags = FLAG_DRIVER_OFF | FLAG_BREAK_ENGAGE;
 
-static bool startInitSequence() {
-    spiBeginTx();
-    SPI.transfer(CMD_START_INIT);
-    const uint8_t ack = SPI.transfer(0x00);
-    spiEndTx();
-    return ack == 0xA5;
-}
-
-// Get buffer and authority state
-// Returns: bit7=authority(0=Robot,1=ESP), bit6-0=writeable flags per node
-static uint8_t getBuffAuthState() {
-    spiBeginTx();
-    SPI.transfer(CMD_GET_AUTH_STATE);
-    const uint8_t state = SPI.transfer(0x00);
-    spiEndTx();
-    return state;
-}
-
-// Take authority from robot (ESP controls setpoints)
-static bool takeAuthority() {
-    spiBeginTx();
-    SPI.transfer(CMD_TAKE_AUTHORITY);
-    const uint8_t ack = SPI.transfer(0x00);
-    spiEndTx();
-    return ack == 0xA5;
-}
-
-// Return authority to robot (Robot controls setpoints)
-static bool returnAuthority() {
-    spiBeginTx();
-    SPI.transfer(CMD_RETURN_AUTHORITY);
-    const uint8_t ack = SPI.transfer(0x00);
-    spiEndTx();
-    return ack == 0xA5;
-}
-
-// Write new position for a specific node (0-5)
-// frame[7] = {NodeID, CMD, Pos1, Pos2, Pos3, Flags, CRC}
-static bool writeNodePosition(uint8_t nodeIndex, const uint8_t frame[7]) {
-    if (nodeIndex > 5) { return false; }
-    spiBeginTx();
-    SPI.transfer(CMD_WRITE_POSITION);
-    SPI.transfer(nodeIndex);
-    for (uint8_t i = 0; i < 7; ++i) { SPI.transfer(frame[i]); }
-    spiEndTx();
-    return true;
-}
-
-// Helper: Create position frame from position value and flags
-static void createPositionFrame(uint8_t nodeId, int32_t position, uint8_t flags, uint8_t frame[7]) {
-    frame[0] = nodeId;
-    frame[1] = 0x31;  // Position command
-    position_to_3bytes(position, frame[2], frame[3], frame[4]);
-    frame[5] = flags;
-    frame[6] = calculate_frame_crc(frame);
-}
-
-// Write extra frame (NodeID 0x20 for Gripper/Reset/Custom commands)
-// frame[7] = {NodeID, CMD, Data1, Data2, Data3, Flags, CRC}
-static bool writeExtraFrame(const uint8_t frame[FRAME_BYTES]) {
-    spiBeginTx();
-    SPI.transfer(CMD_WRITE_EXTRA);
-    for (uint8_t i = 0; i < FRAME_BYTES; ++i) {
-        SPI.transfer(frame[i]);
-    }
-    spiEndTx();
-    return true;
-}
-
-// Read extra frame response (7 bytes)
-// Returns true if response is available, prints raw bytes as HEX
-static bool readExtraResponse() {
-    uint8_t response[FRAME_BYTES]{};
-    spiReadBlock(CMD_READ_EXTRA, response, sizeof(response));
+*/
+enum FPGA_phase {IDLE, INIT_A,INIT_B,INIT_C,INIT_D,LOOP_E};
+// ============================================================================
+// Serial Command Parser
+// ============================================================================
+static void readSerial() {
+    if (!Serial.available()) { return; }
     
-    // Print raw bytes to Serial
-    Serial.print("Extra Response: ");
-    for (uint8_t i = 0; i < FRAME_BYTES; ++i) {
-        printHexByte(response[i]);
-        Serial.print(' ');
-    }
-    Serial.println();
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    cmd.toUpperCase();
     
-    return true;
-}
-
-// Write new position for a node (for now commented out - not called)
-// static void writeNewPosition(uint8_t nodeIndex, int32_t position) {
-//     uint8_t frame[7];
-//     createPositionFrame(NODE_IDS[nodeIndex], position, 0x04, frame);  // 0x04 = motors armed
-//     writeNodePosition(nodeIndex, frame);
-// }
-
-static ControllerStatus readStatus() {
-    uint8_t raw[STATUS_BYTES]{};
-    spiReadBlock(CMD_READ_STATUS, raw, sizeof(raw));
-
-    ControllerStatus status{};
-    status.flags = raw[0];
-    status.phase = raw[1];
-    status.validMask = raw[2];
-    status.currentNodeId = raw[3];
-    status.timeoutCount = static_cast<uint16_t>(raw[5] << 8) | raw[4];
-    status.crcErrorCount = static_cast<uint16_t>(raw[7] << 8) | raw[6];
-    return status;
-}
-
-static void readFrames(uint8_t frames[NODE_COUNT][FRAME_BYTES]) {
-    uint8_t raw[NODE_COUNT * FRAME_BYTES]{};
-    spiReadBlock(CMD_READ_FRAMES, raw, sizeof(raw));
-
-    for (uint8_t nodeIndex = 0; nodeIndex < NODE_COUNT; ++nodeIndex) {
-        for (uint8_t byteIndex = 0; byteIndex < FRAME_BYTES; ++byteIndex) {
-            frames[nodeIndex][byteIndex] = raw[nodeIndex * FRAME_BYTES + byteIndex];
+    // ========== Power Control Commands ==========
+    if (cmd == "VMOTOR,ON" || cmd == "VMOTOR") {    digitalWrite(PIN_EN_77V, HIGH); Serial.println("VMOTOR ON (77V Motor Power)"); }
+    else if (cmd == "VMOTOR,OFF") {digitalWrite(PIN_EN_77V, LOW); Serial.println("VMOTOR OFF"); }
+    else if (cmd == "VSYS,ON" || cmd == "VSYS") {  digitalWrite(PIN_EN_12V_24V, HIGH); Serial.println("VSYS ON (12V/24V System Power)");  }
+    else if (cmd == "VSYS,OFF") { digitalWrite(PIN_EN_12V_24V, LOW); Serial.println("VSYS OFF"); }
+    else if (cmd == "VBREAKS,ON" || cmd == "VBREAKS") {digitalWrite(PIN_EN_BREAK_PWR, HIGH);  Serial.println("VBREAKS ON (24V Brake Power)");  }
+    else if (cmd == "VBREAKS,OFF") { digitalWrite(PIN_EN_BREAK_PWR, LOW);Serial.println("VBREAKS OFF"); }
+    else if (cmd == "ODROID,ON" || cmd == "ODROID") {        digitalWrite(PIN_EN_12V_ODROID, HIGH);        Serial.println("ODROID ON (12V)");    }
+    else if (cmd == "ODROID,OFF") {        digitalWrite(PIN_EN_12V_ODROID, LOW);        Serial.println("ODROID OFF");    }
+    
+    // ========== Authority Commands ==========
+    else if (cmd == "TAKEAUTH" || cmd == "TAKE") {
+        if (takeAuthority()) { Serial.println("Authority taken - ESP controls setpoints");        } 
+        else {  Serial.println("Failed to take authority"); }
+    }
+    else if (cmd == "RETURNAUTH" || cmd == "RETURN") {
+        if (returnAuthority()) {          Serial.println("Authority returned - Robot controls setpoints");        } 
+        else {            Serial.println("Failed to return authority");        }
+    }
+    else if (cmd == "GETAUTH" || cmd == "AUTH") {
+        uint8_t state = getBuffAuthState();
+        Serial.printf("Authority State: 0x%02X - ", state);
+        Serial.println((state & 0x80) ? "ESP has authority" : "Robot has authority");
+        Serial.printf("Buffer writeable flags: 0x%02X\n", state & 0x7F);
+    }
+    
+    // ========== Gripper Commands ==========
+    else if (cmd == "WGRIP" || cmd == "READGRIP") {
+        // Read gripper position: 20 13 00 34 0F 04 0C
+        uint8_t frame[7] = {0x20, 0x13, 0x00, 0x34, 0x0F, 0x04, 0x0C};
+        writeExtraFrame(frame);
+        delay(50);
+        readExtraResponse();
+    }
+    else if (cmd == "GRIPOPEN" || cmd == "OPEN") {
+        // Gripper fully opened: 20 02 B0 00 F8 00 6A
+        uint8_t frame[7] = {0x20, 0x02, 0xB0, 0x00, 0xF8, 0x00, 0x6A};
+        writeExtraFrame(frame);
+        Serial.println("Gripper OPEN command sent");
+        delay(50);
+        readExtraResponse();
+    }
+    else if (cmd == "GRIPCLOSE" || cmd == "CLOSE") {
+        // Gripper fully closed: 20 02 B0 01 F8 00 6B
+        uint8_t frame[7] = {0x20, 0x02, 0xB0, 0x01, 0xF8, 0x00, 0x6B};
+        writeExtraFrame(frame);
+        Serial.println("Gripper CLOSE command sent");
+        delay(50);
+        readExtraResponse();
+    }
+    
+    // ========== Status & Info Commands ==========
+    else if (cmd == "STATUS" || cmd == "ST") {
+        ControllerStatus status = readStatus();
+        Serial.println("=== Controller Status ===");
+        printStatusLine(status);
+    }
+    else if (cmd == "FRAMES" || cmd == "FR") {
+        uint8_t frames[NODE_COUNT][FRAME_BYTES];
+        readFrames(frames);
+        Serial.println("=== Current Frames ===");
+        printSnapshot(latestStatus, frames);
+    }
+    else if (cmd == "INIT") {
+        if (startInitSequence()) {
+            Serial.println("Init sequence started");
+        } else {
+            Serial.println("Init sequence rejected - use RESET first if stuck");
         }
     }
-}
-
-static bool bytesEqual(const uint8_t* left, const uint8_t* right, size_t length) {
-    for (size_t index = 0; index < length; ++index) { if (left[index] != right[index]) { return false; } }  return true;
-}
-
-static bool statusEqual(const ControllerStatus& left, const ControllerStatus& right) {
-    return left.flags == right.flags && left.phase == right.phase && left.validMask == right.validMask &&
-           left.currentNodeId == right.currentNodeId && left.timeoutCount == right.timeoutCount && left.crcErrorCount == right.crcErrorCount;
-}
-
-static const char* phaseName(uint8_t phase) {
-    switch (phase) {
-        case 0: return "IDLE";
-        case 1: return "INIT_A";
-        case 2: return "INIT_B";
-        case 3: return "INIT_C";
-        case 4: return "INIT_D";
-        case 5: return "LOOP_E";
-        default: return "UNKNOWN";
+    else if (cmd == "RESET") {
+        if (resetController()) {
+            Serial.println("Controller reset to IDLE state");
+        } else {
+            Serial.println("Reset command failed");
+        }
+    }
+    
+    // ========== Custom Extra Frame ==========
+    else if (cmd.startsWith("EXTRA ")) {
+        // Format: EXTRA 20 03 A0 C6 97 B4 66
+        uint8_t frame[7] = {0};
+        int idx = 6; // Skip "EXTRA "
+        int byteIdx = 0;
+        
+        while (idx < cmd.length() && byteIdx < 7) {
+            // Skip spaces
+            while (idx < cmd.length() && cmd[idx] == ' ') { idx++; }
+            if (idx >= cmd.length()) { break; }
+            
+            // Parse hex byte
+            String hexByte = "";
+            while (idx < cmd.length() && cmd[idx] != ' ') {
+                hexByte += cmd[idx];
+                idx++;
+            }
+            
+            if (hexByte.length() > 0) {
+                frame[byteIdx++] = strtol(hexByte.c_str(), NULL, 16);
+            }
+        }
+        
+        if (byteIdx == 7) {
+            writeExtraFrame(frame);
+            Serial.print("Extra frame sent: ");
+            for (int i = 0; i < 7; i++) {
+                if (frame[i] < 0x10) Serial.print("0");
+                Serial.print(frame[i], HEX);
+                Serial.print(" ");
+            }
+            Serial.println();
+            delay(50);
+            readExtraResponse();
+        } else {
+            Serial.println("Error: EXTRA command needs 7 hex bytes");
+        }
+    }
+    
+    // ========== Help ==========
+    else if (cmd == "HELP" || cmd == "?") {
+        Serial.println("\n=== Available Commands ===");
+        Serial.println("Power Control:");
+        Serial.println("  VMOTOR,ON / VMOTOR,OFF  - 77V Motor Power");
+        Serial.println("  VSYS,ON / VSYS,OFF      - 12V/24V System Power");
+        Serial.println("  VBREAKS,ON / VBREAKS,OFF - 24V Brake Power");
+        Serial.println("  ODROID,ON / ODROID,OFF  - 12V Odroid Power");
+        Serial.println("\nAuthority:");
+        Serial.println("  TAKEAUTH / TAKE         - ESP takes control");
+        Serial.println("  RETURNAUTH / RETURN     - Robot takes control");
+        Serial.println("  GETAUTH / AUTH          - Show authority state");
+        Serial.println("\nGripper:");
+        Serial.println("  WGRIP / READGRIP        - Read gripper position");
+        Serial.println("  GRIPOPEN / OPEN         - Open gripper");
+        Serial.println("  GRIPCLOSE / CLOSE       - Close gripper");
+        Serial.println("\nStatus:");
+        Serial.println("  STATUS / ST             - Show controller status");
+        Serial.println("  FRAMES / FR             - Show all frames");
+        Serial.println("\nControl:");
+        Serial.println("  INIT                    - Start init sequence");
+        Serial.println("  RESET                   - Reset controller to IDLE");
+        Serial.println("\nCustom:");
+        Serial.println("  EXTRA <7 hex bytes>     - Send custom extra frame");
+        Serial.println("  HELP / ?                - Show this help\n");
+    }
+    
+    else if (cmd.length() > 0) {
+        Serial.println("Unknown command. Type HELP for available commands.");
     }
 }
 
-static void printStatusLine(const ControllerStatus& status) {
-    Serial.printf("state= %s  flags=0x%02X  validMask=0x%02X  currentNode=0x%02X  timeouts= %i crcErrors= %i \n",
-        phaseName(status.phase),status.flags,status.validMask, status.currentNodeId, status.timeoutCount, status.crcErrorCount);
-}
 
-static void printFrameSummary(uint8_t nodeIndex, const uint8_t frame[FRAME_BYTES], bool valid) {
 
-    if (!valid) { Serial.printf(" 0x%02X pos=------ status=-- -- crc=--\n",NODE_IDS[nodeIndex]); return; } 
-    const int32_t signedPosition = reinterpret_24bit_signed(static_cast<uint32_t>(frame[1]) | (static_cast<uint32_t>(frame[2]) << 8) | (static_cast<uint32_t>(frame[3]) << 16));
-    Serial.printf(" 0x%02X  pos= %+d raw=0x%02X%02X%02X  status=0x%02X %02X crc=0x%02X \n",NODE_IDS[nodeIndex], signedPosition, frame[1],frame[2],frame[3],frame[4],frame[5],frame[6]);
 
-}
+static void pollFPGA(){
+    static bool vSysLast = false;
+    static uint32_t initDelayMs = 0;
+    static uint32_t lastPollUs = 0;
+    static uint32_t lastPrintMs = 0;
+    static uint32_t lastStartRetryMs = 0;
 
-static void printSnapshot(const ControllerStatus& status, uint8_t frames[NODE_COUNT][FRAME_BYTES]) {
-    printStatusLine(status);
-    for (uint8_t nodeIndex = 0; nodeIndex < NODE_COUNT; ++nodeIndex) {
-        const bool valid = ((status.validMask >> nodeIndex) & 0x01u) != 0;
-        printFrameSummary(nodeIndex, frames[nodeIndex], valid);
+    const uint32_t nowUs = micros();
+    if ((uint32_t)(nowUs - lastPollUs) < POLL_INTERVAL_US) { return; }
+    lastPollUs = nowUs;
+    const uint32_t nowMs = millis();
+    vSys = digitalRead(PIN_EN_12V_24V);
+    if(!vSysLast && vSys){
+        initDelayMs = nowMs + 3000; 
+        Serial.println(" FPGA polling started");
+        Serial.println(" Power up sequence: VMOTOR -> VBREAKS -> send 'INIT' command");
     }
-    Serial.println();
+    vSysLast = vSys;
+    if(!vSys || !vSysLast || initDelayMs == 0 || nowMs < initDelayMs) return;
+
+
+    latestStatus = readStatus();
+
+    // Auto-start disabled - user must send "INIT" command manually
+    // if (!controllerRunning(latestStatus) && (uint32_t)(nowMs - lastStartRetryMs) >= 1000u) {
+    //     if (startInitSequence()) { Serial.println("Init sequence started"); } 
+    //     else { Serial.println("Init sequence start rejected");    }
+    //     lastStartRetryMs = nowMs;
+    // }
+
+
+
+    if(latestStatus.phase != LOOP_E){
+        if ((uint32_t)(nowMs - lastPrintMs) < FORCE_PRINT_MS) { return; }
+        lastPrintMs = nowMs;
+        printStatusLine(latestStatus);
+        previousStatus = latestStatus;
+    }
+    else{
+        readFrames(latestFrames);
+
+        bool changed = false;// = !previousSnapshotValid || !statusEqual(latestStatus, previousStatus);
+        for (uint8_t nodeIndex = 0; nodeIndex < NODE_COUNT && !changed; ++nodeIndex) {
+            if( !bytesEqual(latestFrames[nodeIndex], previousFrames[nodeIndex], FRAME_BYTES)){changed = true; break;}    
+        }
+        if (((uint32_t)(nowMs - lastPrintMs) < FORCE_PRINT_MS) || !changed) { return; }
+        lastPrintMs = nowMs;
+        printSnapshot(latestStatus, latestFrames);
+        for (uint8_t nodeIndex = 0; nodeIndex < NODE_COUNT; ++nodeIndex) {
+            for (uint8_t byteIndex = 0; byteIndex < FRAME_BYTES; ++byteIndex) {
+                previousFrames[nodeIndex][byteIndex] = latestFrames[nodeIndex][byteIndex];
+            }
+        }
+    }
+
+
+    //previousSnapshotValid = true;
+    
+    
 }
 
-static bool controllerRunning(const ControllerStatus& status) { return (status.flags & 0x01u) != 0; }
 
 void setup() {
-    Serial.begin(UART_BAUD);
-    delay(200);
+    pinMode(PIN_EN_77V, OUTPUT);
+    pinMode(PIN_EN_12V_ODROID, OUTPUT);
+    pinMode(PIN_EN_12V_24V, OUTPUT);
+    pinMode(PIN_EN_BREAK_PWR, OUTPUT);
+    digitalWrite(PIN_EN_77V, LOW);
+    digitalWrite(PIN_EN_12V_ODROID, LOW);
+    digitalWrite(PIN_EN_12V_24V, LOW);
+    digitalWrite(PIN_EN_BREAK_PWR, LOW);
 
-    pinMode(PIN_SPI_CS, OUTPUT);
+    gpio_pulldown_en((gpio_num_t)PIN_EN_77V);
+    gpio_pulldown_en((gpio_num_t)PIN_EN_12V_ODROID);
+    gpio_pulldown_en((gpio_num_t)PIN_EN_12V_24V);
+    gpio_pulldown_en((gpio_num_t)PIN_EN_BREAK_PWR);
+    
+    Serial.begin(UART_BAUD);
+    // Debug - Wait for CDC & serial monitor
+    delay(1000);  // Warte auf USB CDC Initialisierung
+    unsigned long start = millis();
+    while (!Serial && (millis() - start < 3000)) {delay(10);}
+    
+    Serial.println("\n\n=== ESP32-S3 FPGA Controller Starting ===");
+    Serial.println("USB CDC initialized");
+    Serial.println("Power control pins secured with pull-downs");
+// delay(500); 
+//  digitalWrite(PIN_EN_77V,HIGH);
+//  delay(500); 
+//   digitalWrite(PIN_EN_12V_ODROID,HIGH);
+//    delay(500); 
+//  digitalWrite(PIN_EN_12V_24V,HIGH);
+//   delay(500); 
+//  digitalWrite(PIN_EN_BREAK_PWR,HIGH);
+//   delay(500); 
+//    digitalWrite(PIN_EN_77V,LOW);
+//    delay(500);   
+//  digitalWrite(PIN_EN_12V_ODROID,LOW);
+//    delay(500); 
+//  digitalWrite(PIN_EN_12V_24V,LOW);
+//    delay(500); 
+//  digitalWrite(PIN_EN_BREAK_PWR,LOW);
+
+
+
+     pinMode(PIN_SPI_CS, OUTPUT);
     digitalWrite(PIN_SPI_CS, HIGH);
     pinMode(PIN_FRAME_BLOCK_DONE, INPUT);  // Frame block done signal from FPGA
     SPI.begin(PIN_SPI_SCLK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SPI_CS);
 
     Serial.println("FPGA controller poller ready");
-    if (startInitSequence()) { Serial.println("Init sequence started"); } 
-    else { Serial.println("Init sequence start rejected");    }
+    Serial.println("Send 'INIT' command to start initialization sequence");
+    // Auto-start disabled - use serial command "INIT" to start initialization
 
-    // Example usage of authority & position control (commented out):
+
+ // Example usage of authority & position control (commented out):
     // delay(5000);  // Wait for init to complete
     // if (takeAuthority()) {
     //     Serial.println("Authority taken");
@@ -361,38 +418,7 @@ void setup() {
 }
 
 void loop() {
-    static uint32_t lastPollUs = 0;
-    static uint32_t lastPrintMs = 0;
-    static uint32_t lastStartRetryMs = 0;
-
-    const uint32_t nowUs = micros();
-    if ((uint32_t)(nowUs - lastPollUs) < POLL_INTERVAL_US) { return; }
-    lastPollUs = nowUs;
-
-    latestStatus = readStatus();
-
-    const uint32_t nowMs = millis();
-    if (!controllerRunning(latestStatus) && (uint32_t)(nowMs - lastStartRetryMs) >= 1000u) {
-        if (startInitSequence()) { Serial.println("Init sequence retriggered"); }
-        lastStartRetryMs = nowMs;
-    }
-
-    readFrames(latestFrames);
-
-    bool changed = !previousSnapshotValid || !statusEqual(latestStatus, previousStatus);
-    for (uint8_t nodeIndex = 0; nodeIndex < NODE_COUNT && !changed; ++nodeIndex) {
-        changed = !bytesEqual(latestFrames[nodeIndex], previousFrames[nodeIndex], FRAME_BYTES);
-    }
-
-    if (!changed && (uint32_t)(nowMs - lastPrintMs) < FORCE_PRINT_MS) { return; }
-
-    printSnapshot(latestStatus, latestFrames);
-    previousStatus = latestStatus;
-    for (uint8_t nodeIndex = 0; nodeIndex < NODE_COUNT; ++nodeIndex) {
-        for (uint8_t byteIndex = 0; byteIndex < FRAME_BYTES; ++byteIndex) {
-            previousFrames[nodeIndex][byteIndex] = latestFrames[nodeIndex][byteIndex];
-        }
-    }
-    previousSnapshotValid = true;
-    lastPrintMs = nowMs;
+    
+    readSerial(); // Check for serial commands
+    pollFPGA(); // poll new frames from FPGA each 1ms
 }
