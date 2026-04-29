@@ -6,33 +6,18 @@ void setup() {
     delay(2000);
     
     Serial.println("\n=== CRS F3 Kinematics Sanity Check ===\n");
-    Serial.println("Drücke ENTER im seriellen Monitor um den Test zu starten...\n");
-    
-    // Warte auf Benutzereingabe
-    while (Serial.available() == 0) {
-        delay(100);
-    }
-    
-    // Leere den Serial-Buffer
-    while (Serial.available() > 0) {
-        Serial.read();
-    }
-    
-    Serial.println("\n=== CRS F3 Kinematics Sanity Check ===\n");
     
     CRS_Kinematics kin;
     
     // Test: Forward Kinematics at home position (0,0,0,0,0,0)
     Joint6D joints_home(0, 0, 0, 0, 0, 0);
-    Joint6D joints_max_x_reach(0, -90, -90, 0, 0, 0);
     Pose6D pose;
     
     Serial.println("Testing FK at HOME position:");
-    //Serial.println("Joint Angles: J1=0 J2=0 J3=0 J4=0 J5=0 J6=0");
-    Serial.println("Joint Angles: J1=0 J2=-90 J3=0 J4=0 J5=0 J6=0");
+    Serial.println("Joint Angles: J1=0 J2=0 J3=0 J4=0 J5=0 J6=0");
     Serial.println();
     
-    if (kin.solveFK(joints_max_x_reach, pose)) {
+    if (kin.solveFK(joints_home, pose)) {
         Serial.println("Forward Kinematics Result:");
         Serial.printf("  Position: X=%.2f  Y=%.2f  Z=%.2f mm\n", pose.X, pose.Y, pose.Z);
         Serial.printf("  Orientation: A=%.2f  B=%.2f  C=%.2f degrees\n", pose.A, pose.B, pose.C);
